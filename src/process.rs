@@ -3269,7 +3269,18 @@ pub fn stop_vm_process(
 
     // Phase 1: SIGTERM + poll
     if !terminate(pid) {
-        return Ok(try_wait(pid).unwrap_or(UNKNOWN_EXIT_CODE));
+        // A failed signal is not evidence of exit: EPERM leaves the VMM alive.
+        // Only return success when the child has exited or the PID is gone.
+        if let Some(code) = try_wait(pid) {
+            return Ok(code);
+        }
+        if !is_alive(pid) {
+            return Ok(UNKNOWN_EXIT_CODE);
+        }
+        return Err(Error::agent(
+            "stop vm process",
+            format!("process {pid} is still alive after SIGTERM failed"),
+        ));
     }
 
     if let Some(code) = poll_for_exit(pid, sigterm_timeout) {
@@ -3345,6 +3356,14 @@ fn wait_for_exit_event(pid: Pid, timeout: Duration) -> ExitEvent {
     }
 }
 
+/// kqueue can report EV_ERROR as an event; only NOTE_EXIT confirms death.
+#[cfg(target_os = "macos")]
+fn mac_process_exit_event(event: &libc::kevent) -> bool {
+    event.filter == libc::EVFILT_PROC
+        && event.flags & libc::EV_ERROR == 0
+        && event.fflags & libc::NOTE_EXIT != 0
+}
+
 /// [`wait_for_exit_event`] through kqueue's `NOTE_EXIT`.
 #[cfg(target_os = "macos")]
 fn wait_for_exit_event(pid: Pid, timeout: Duration) -> ExitEvent {
@@ -3383,7 +3402,11 @@ fn wait_for_exit_event(pid: Pid, timeout: Duration) -> ExitEvent {
         // SAFETY: waits for at most one event into `event`, with a valid timeout.
         let rc = unsafe { libc::kevent(kq_fd, std::ptr::null(), 0, &mut event, 1, &wait) };
         if rc > 0 {
-            return ExitEvent::Exited;
+            return if mac_process_exit_event(&event) {
+                ExitEvent::Exited
+            } else {
+                ExitEvent::Unavailable
+            };
         }
         if rc == 0 {
             if Instant::now() < deadline {
@@ -3413,7 +3436,7 @@ pub(crate) fn poll_for_exit(pid: Pid, timeout: Duration) -> Option<i32> {
     match wait_for_exit_event(pid, timeout) {
         // Reaps our own child and reads its code. Anyone else's exit code is
         // not ours to read.
-        ExitEvent::Exited => return Some(try_wait(pid).unwrap_or(UNKNOWN_EXIT_CODE)),
+        ExitEvent::Exited => return Some(reap_after_exit_event(pid)),
         ExitEvent::TimedOut => {
             return try_wait(pid).or_else(|| (!is_alive(pid)).then_some(UNKNOWN_EXIT_CODE));
         }
@@ -3439,6 +3462,26 @@ pub(crate) fn poll_for_exit(pid: Pid, timeout: Duration) -> Option<i32> {
         std::thread::sleep(interval);
     }
     None
+}
+
+/// How long to keep trying to reap a child after its exit event. The event can
+/// arrive a moment before the child is reapable; until it is reaped it stays a
+/// zombie that [`is_alive`] counts as running.
+const REAP_AFTER_EXIT_EVENT: Duration = Duration::from_millis(100);
+
+/// Reap `pid` after its exit event and read its exit code: our own child
+/// within [`REAP_AFTER_EXIT_EVENT`], anyone else's as soon as it is gone.
+fn reap_after_exit_event(pid: Pid) -> i32 {
+    let deadline = Instant::now() + REAP_AFTER_EXIT_EVENT;
+    loop {
+        if let Some(code) = try_wait(pid) {
+            return code;
+        }
+        if !is_alive(pid) || Instant::now() >= deadline {
+            return UNKNOWN_EXIT_CODE;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// Result of a fork operation.
@@ -3859,6 +3902,20 @@ extern "C" fn sigint_kill_handler(_sig: libc::c_int) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn kqueue_errors_are_not_process_exit_events() {
+        let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+        event.filter = libc::EVFILT_PROC;
+        event.fflags = libc::NOTE_EXIT;
+        assert!(super::mac_process_exit_event(&event));
+        event.flags = libc::EV_ERROR;
+        assert!(!super::mac_process_exit_event(&event));
+        event.flags = 0;
+        event.fflags = 0;
+        assert!(!super::mac_process_exit_event(&event));
+    }
+
     #[cfg(unix)]
     #[test]
     fn poll_for_exit_reads_a_child_exit_code() {

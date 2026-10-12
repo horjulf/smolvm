@@ -2803,7 +2803,34 @@ fn spawn_idle_reclaim(ctl: PathBuf, memory_mib: u32, idle_minutes: u64) {
             let tv = |t: libc::timeval| Duration::new(t.tv_sec as u64, (t.tv_usec as u32) * 1000);
             Some(tv(ru.ru_utime) + tv(ru.ru_stime))
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::FILETIME;
+            use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+            let zero = FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            };
+            let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+            // SAFETY: pseudo-handle for this process and four valid out-params.
+            let ok = unsafe {
+                GetProcessTimes(
+                    GetCurrentProcess(),
+                    &mut created,
+                    &mut exited,
+                    &mut kernel,
+                    &mut user,
+                )
+            };
+            if ok == 0 {
+                return None;
+            }
+            // FILETIME counts 100 ns intervals.
+            let ticks =
+                |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+            Some(Duration::from_nanos((ticks(kernel) + ticks(user)) * 100))
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             None
         }
@@ -3058,7 +3085,11 @@ mod tests {
         f.allow_image_pull_egress(Some("ghcr.io/acme/app:1"), false);
         assert_eq!(
             f.dns_filter_hosts.unwrap(),
-            vec!["api.anthropic.com".to_string(), "ghcr.io".to_string()]
+            vec![
+                "api.anthropic.com".to_string(),
+                "ghcr.io".to_string(),
+                "githubusercontent.com".to_string()
+            ]
         );
     }
 

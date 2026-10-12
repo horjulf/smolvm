@@ -682,13 +682,14 @@ pub struct RunCmd {
     pub trust_host_certs: bool,
 
     /// Bind a credential the workload may use without ever seeing it:
-    /// NAME=ENV_VAR@HOST[,HOST...]. The guest gets a placeholder in ENV_VAR;
+    /// NAME=ENV_VAR@HOST[,HOST...][:body]. The guest gets a placeholder in ENV_VAR;
     /// the host substitutes the real value (from a `--secret-env`/`--secret-file`
     /// ref of the same name, else the host variable ENV_VAR) only on HTTPS
-    /// requests to the listed hosts. Can be used multiple times; implies --net.
+    /// requests to the listed hosts. Add :body for OAuth form-body tokens.
+    /// Can be used multiple times; implies --net.
     #[arg(
         long = "credential",
-        value_name = "NAME=ENV_VAR@HOST",
+        value_name = "NAME=ENV_VAR@HOST[:body]",
         help_heading = "Network"
     )]
     pub credential: Vec<String>,
@@ -4018,11 +4019,12 @@ pub struct CreateCmd {
     pub trust_host_certs: bool,
 
     /// Bind a credential the workload may use without ever seeing it:
-    /// NAME=ENV_VAR@HOST[,HOST...]. The guest gets a placeholder in ENV_VAR;
+    /// NAME=ENV_VAR@HOST[,HOST...][:body]. The guest gets a placeholder in ENV_VAR;
     /// the host substitutes the real value (from a `--secret-env`/`--secret-file`
     /// ref of the same name, else the host variable ENV_VAR) only on HTTPS
-    /// requests to the listed hosts. Can be used multiple times; implies --net.
-    #[arg(long = "credential", value_name = "NAME=ENV_VAR@HOST")]
+    /// requests to the listed hosts. Add :body for OAuth form-body tokens.
+    /// Can be used multiple times; implies --net.
+    #[arg(long = "credential", value_name = "NAME=ENV_VAR@HOST[:body]")]
     pub credential: Vec<String>,
 
     /// Restrict outbound to localhost only (implies --net)
@@ -5888,6 +5890,16 @@ pub struct UpdateCmd {
     #[arg(long = "remove-allow-cidr", value_parser = parse_cidr, value_name = "CIDR")]
     pub remove_allow_cidr: Vec<String>,
 
+    /// Start from an empty allow list before applying this update's
+    /// --allow-host, --allow-host-pattern and --allow-cidr entries, so the
+    /// machine ends up with exactly those and nothing it allowed before. With
+    /// --net and no entries the machine may reach every host.
+    #[arg(
+        long = "reset-allow-list",
+        conflicts_with_all = ["remove_allow_host", "remove_allow_cidr"]
+    )]
+    pub reset_allow_list: bool,
+
     /// Add/replace environment variable (KEY=VALUE)
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
@@ -5946,6 +5958,7 @@ impl UpdateCmd {
             remove_allow_cidrs: self.remove_allow_cidr.clone(),
             outbound_localhost_only: self.outbound_localhost_only,
             allow_all: self.net,
+            reset_allow_list: self.reset_allow_list,
         })
     }
 
@@ -5970,6 +5983,7 @@ impl UpdateCmd {
             outbound_localhost_only,
             remove_allow_host,
             remove_allow_cidr,
+            reset_allow_list,
             env,
             remove_env,
             workdir,
@@ -5987,7 +6001,8 @@ impl UpdateCmd {
             || !allow_host_pattern.is_empty()
             || !allow_cidr.is_empty()
             || !remove_allow_host.is_empty()
-            || !remove_allow_cidr.is_empty();
+            || !remove_allow_cidr.is_empty()
+            || *reset_allow_list;
         let other = !volume.is_empty()
             || !remove_volume.is_empty()
             || !port.is_empty()
@@ -6846,6 +6861,9 @@ impl SyncCmd {
         if record.staged_mounts.is_empty() {
             println!("Machine '{name}' has no staged mounts");
             return Ok(());
+        }
+        if let Some(error) = smolvm::staged_mount::refuse_detached_sync(&record, &name) {
+            return Err(error);
         }
 
         let _source_lock = smolvm::agent::fork::lock_fork_source(&name)?;

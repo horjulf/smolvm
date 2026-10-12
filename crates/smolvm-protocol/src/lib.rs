@@ -94,6 +94,8 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The agent can freeze internal filesystems before acknowledging shutdown.
 pub const QUIESCED_SHUTDOWN_CAPABILITY: &str = "quiesced-shutdown-v1";
+/// Guest supports preparing file access without executing a command from the image.
+pub const PREPARE_FILE_ACCESS_CAPABILITY: &str = "prepare-file-access-v1";
 
 /// virtiofs tag under which the host exposes the Rosetta 2 Linux runtime to the
 /// guest. Shared host↔guest so the launcher's `krun_add_virtiofs` tag and the
@@ -435,6 +437,10 @@ pub enum AgentRequest {
     Pull {
         /// Image reference (e.g., "alpine:latest", "docker.io/library/ubuntu:22.04").
         image: String,
+        /// Cache key exposed to later query/run requests when `image` was
+        /// rewritten to a registry mirror by the host.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_as: Option<String>,
         /// OCI platform to pull (e.g., "linux/arm64", "linux/amd64").
         oci_platform: Option<String>,
         /// Optional registry authentication credentials.
@@ -472,6 +478,15 @@ pub enum AgentRequest {
         /// Image reference.
         image: String,
         /// Unique workload ID for the overlay.
+        workload_id: String,
+    },
+
+    /// Start the image-independent keepalive container for file I/O without
+    /// executing any binary supplied by the image.
+    PrepareFileAccess {
+        /// Image whose persistent filesystem the file operation targets.
+        image: String,
+        /// Owner of the persistent overlay (which may differ for a fork).
         workload_id: String,
     },
 
@@ -933,6 +948,7 @@ impl AgentRequest {
             AgentRequest::ListImages => "ListImages".into(),
             AgentRequest::GarbageCollect { .. } => "GarbageCollect".into(),
             AgentRequest::PrepareOverlay { .. } => "PrepareOverlay".into(),
+            AgentRequest::PrepareFileAccess { .. } => "PrepareFileAccess".into(),
             AgentRequest::CleanupOverlay { .. } => "CleanupOverlay".into(),
             AgentRequest::FormatStorage => "FormatStorage".into(),
             AgentRequest::StorageStatus => "StorageStatus".into(),
@@ -1692,6 +1708,7 @@ mod tests {
     fn test_encode_decode_roundtrip() {
         let req = AgentRequest::Pull {
             image: "alpine:latest".to_string(),
+            cache_as: Some("docker.io/library/alpine:latest".to_string()),
             oci_platform: Some("linux/arm64".to_string()),
             auth: None,
             proxy: None,
@@ -1703,6 +1720,7 @@ mod tests {
 
         let AgentRequest::Pull {
             image,
+            cache_as,
             oci_platform,
             auth,
             proxy,
@@ -1712,6 +1730,10 @@ mod tests {
             panic!("expected Pull variant, got {:?}", decoded);
         };
         assert_eq!(image, "alpine:latest");
+        assert_eq!(
+            cache_as,
+            Some("docker.io/library/alpine:latest".to_string())
+        );
         assert_eq!(oci_platform, Some("linux/arm64".to_string()));
         assert!(auth.is_none());
         assert!(proxy.is_none());
@@ -1722,6 +1744,7 @@ mod tests {
     fn test_encode_decode_with_auth() {
         let req = AgentRequest::Pull {
             image: "ghcr.io/owner/repo:latest".to_string(),
+            cache_as: None,
             oci_platform: None,
             auth: Some(RegistryAuth {
                 username: "testuser".to_string(),
@@ -1736,6 +1759,7 @@ mod tests {
 
         let AgentRequest::Pull {
             image,
+            cache_as,
             oci_platform,
             auth,
             proxy: _,
@@ -1745,6 +1769,7 @@ mod tests {
             panic!("expected Pull variant, got {:?}", decoded);
         };
         assert_eq!(image, "ghcr.io/owner/repo:latest");
+        assert!(cache_as.is_none());
         assert!(oci_platform.is_none());
         let auth = auth.expect("auth should be Some");
         assert_eq!(auth.username, "testuser");
@@ -1755,6 +1780,7 @@ mod tests {
     fn test_encode_decode_with_proxy() {
         let req = AgentRequest::Pull {
             image: "alpine:latest".to_string(),
+            cache_as: None,
             oci_platform: None,
             auth: None,
             proxy: Some("http://192.168.127.254:3128".to_string()),
@@ -1801,6 +1827,24 @@ mod tests {
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("prepare_overlay"));
+    }
+
+    #[test]
+    fn prepare_file_access_wire_only_identifies_the_image_and_overlay() {
+        let request = AgentRequest::PrepareFileAccess {
+            image: "alpine:3.20".into(),
+            workload_id: "fork-overlay-owner".into(),
+        };
+        let wire = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            wire,
+            r#"{"method":"prepare_file_access","image":"alpine:3.20","workload_id":"fork-overlay-owner"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<AgentRequest>(&wire).unwrap(),
+            AgentRequest::PrepareFileAccess { image, workload_id }
+                if image == "alpine:3.20" && workload_id == "fork-overlay-owner"
+        ));
     }
 
     #[test]

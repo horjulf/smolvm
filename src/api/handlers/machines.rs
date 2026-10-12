@@ -2331,15 +2331,13 @@ pub async fn create_machine(
 /// is a private request-scoped handoff, not a public option.
 async fn create_machine_inner(
     State(state): State<Arc<ApiState>>,
-    Json(req): Json<CreateMachineRequest>,
+    Json(mut req): Json<CreateMachineRequest>,
     verified: Option<crate::portable_checkpoint::VerifiedSidecar>,
     cached_checkpoint: bool,
 ) -> Result<Json<MachineInfo>, ApiError> {
     // Refused before any image pull or disk work, so a server that has not opted
     // in never builds a nested machine.
     state.ensure_nested_virt_allowed(req.nested_virt)?;
-    #[cfg(target_os = "linux")]
-    let mut req = req;
     #[cfg(target_os = "linux")]
     let _prepared = if let Some(reference) = req
         .from
@@ -2376,6 +2374,12 @@ async fn create_machine_inner(
         ));
     }
 
+    // Resolve local images after validating the exclusive source choice, before
+    // creating or registering the machine. This persists a stable local: ref.
+    if let Some(image) = req.image.take() {
+        req.image = Some(resolve_api_image(&state, image).await?);
+    }
+
     // Published ports need the inbound path that only virtio-net has. With an
     // UNSET backend the launcher auto-selects virtio-net when ports are present
     // (see `plan_launch_network`), so ports "just work" without per-request
@@ -2408,8 +2412,6 @@ async fn create_machine_inner(
     }
 
     // If registry_ref is set, pull the artifact from the registry and treat as `from`
-    #[cfg(not(target_os = "linux"))]
-    let mut req = req;
     // Where a pack came from, kept on the machine so a live checkpoint of it can
     // name the pack for a host that has to fetch it.
     let mut pack_registry_ref: Option<String> = None;
@@ -3303,6 +3305,54 @@ async fn create_machine_inner(
         .ok_or_else(|| ApiError::internal("machine disappeared after creation".to_string()))?;
 
     Ok(Json(record_to_info(&name, &record)))
+}
+
+/// Normalize an API image before the machine is registered. A registry
+/// reference passes through. A local archive or rootfs directory is accepted
+/// only under the server's `--local-image-dir`, after resolving symlinks, since
+/// a path names the server's own files; an already-resolved `local:` /
+/// `local-dir:` reference is never accepted from a caller. A request has no
+/// stdin archive stream, so `-` fails. Hashing multi-GiB archives runs off the
+/// Tokio reactor.
+async fn resolve_api_image(state: &ApiState, image: String) -> Result<String, ApiError> {
+    use crate::data::image_source::{
+        classify, is_local_ref, resolve, ArchiveInput, ImageSource, ResolvedImage,
+    };
+    if is_local_ref(&image) {
+        return Err(ApiError::BadRequest(
+            "image names a resolved local source; give the archive or directory path".into(),
+        ));
+    }
+    let path = match classify(&image) {
+        ImageSource::Registry(_) => return Ok(image),
+        ImageSource::Archive(ArchiveInput::Stdin) => {
+            return Err(ApiError::BadRequest(
+                "image '-' requires CLI stdin; give the API a server-local archive path".into(),
+            ))
+        }
+        ImageSource::Unsupported { hint, .. } => return Err(ApiError::BadRequest(hint)),
+        ImageSource::Archive(ArchiveInput::File(path)) | ImageSource::Directory(path) => path,
+    };
+    let dir = state.local_image_dir()?;
+    let canonical = path.canonicalize().map_err(|error| {
+        ApiError::BadRequest(format!("local image '{}': {error}", path.display()))
+    })?;
+    if !canonical.starts_with(&dir) {
+        return Err(ApiError::BadRequest(format!(
+            "local image '{}' is outside this server's local image directory",
+            path.display()
+        )));
+    }
+    let source = classify(&canonical.to_string_lossy());
+    tokio::task::spawn_blocking(move || resolve(source))
+        .await
+        .map_err(|error| ApiError::internal(format!("image resolution task failed: {error}")))?
+        .map(|resolved| match resolved {
+            ResolvedImage::Registry(reference) | ResolvedImage::Local { reference, .. } => {
+                reference
+            }
+        })
+        .map_err(|error| ApiError::BadRequest(error.to_string()))
 }
 
 /// List all machines.
@@ -4205,10 +4255,11 @@ const MAX_CONCURRENT_BRANCH_BOOTS: usize = 8;
 /// requests queued for it. Every queued request was sent before the batch takes
 /// its checkpoint, so one checkpoint taken then is a state of the source each
 /// of them could have branched alone; for a running source this replaces one
-/// checkpoint per child with one per batch. Held pool slots and pinned ports
-/// keep the one-at-a-time path.
+/// checkpoint per child with one per batch. Pinned ports go with their child,
+/// and a host port asked for twice fails only the later request. Held pool
+/// slots keep the one-at-a-time path.
 fn coalescable_branch(req: &ForkRequest) -> bool {
-    !req.hold && req.ports.is_empty()
+    !req.hold
 }
 
 /// Take the source as a single branch does, then serve every compatible
@@ -4247,8 +4298,9 @@ async fn branch_batch_transaction(
 ) {
     let mut accepted = Vec::with_capacity(batch.len());
     let mut names = std::collections::HashSet::new();
+    let mut host_ports = std::collections::HashSet::new();
     for queued in batch {
-        match check_queued_branch(state, golden, &queued.req, &mut names).await {
+        match check_queued_branch(state, golden, &queued.req, &mut names, &mut host_ports).await {
             Ok(fork_env) => accepted.push((queued, fork_env)),
             Err(error) => {
                 let _ = queued.reply.send(Err(error));
@@ -4350,6 +4402,12 @@ async fn prepare_and_boot_branches(
             .map(|(queued, fork_env)| {
                 (
                     queued.req.name.clone(),
+                    queued
+                        .req
+                        .ports
+                        .iter()
+                        .map(|p| (p.host, p.guest))
+                        .collect::<Vec<(u16, u16)>>(),
                     queued.req.forkable,
                     fork_env.clone(),
                     queued.req.secrets.clone(),
@@ -4360,9 +4418,9 @@ async fn prepare_and_boot_branches(
             let specs: Vec<_> = children
                 .iter()
                 .map(
-                    |(clone, forkable, fork_env, secrets)| crate::agent::fork::ForkSpec {
+                    |(clone, ports, forkable, fork_env, secrets)| crate::agent::fork::ForkSpec {
                         clone,
-                        pinned_ports: &[],
+                        pinned_ports: ports,
                         clone_forkable: *forkable,
                         fork_env,
                         fork_secrets: secrets,
@@ -4412,12 +4470,43 @@ async fn prepare_and_boot_branches(
 
 /// The checks a single branch makes before preparing its child. Returns the
 /// child's parsed environment. `names` collects the batch's child names.
+/// Validate a branch's pinned ports as the create path does: a branch uses
+/// these host ports as-is, so port 0 or a duplicated host port would otherwise
+/// surface only as a confusing child-boot bind failure instead of a clean 400.
+fn validate_pinned_ports(pinned_ports: &[(u16, u16)]) -> Result<(), ApiError> {
+    let mut seen = std::collections::HashSet::new();
+    for (host, guest) in pinned_ports {
+        if *host == 0 || *guest == 0 {
+            return Err(ApiError::BadRequest(
+                "port 0 is not valid for VM port forwarding".to_string(),
+            ));
+        }
+        if !seen.insert(*host) {
+            return Err(ApiError::BadRequest(format!(
+                "duplicate host port {host}: each host port can only be mapped once"
+            )));
+        }
+    }
+    Ok(())
+}
+
 async fn check_queued_branch(
     state: &ApiState,
     golden: &str,
     req: &ForkRequest,
     names: &mut std::collections::HashSet<String>,
+    host_ports: &mut std::collections::HashSet<u16>,
 ) -> Result<Vec<(String, String)>, ApiError> {
+    let pinned_ports: Vec<(u16, u16)> = req.ports.iter().map(|p| (p.host, p.guest)).collect();
+    validate_pinned_ports(&pinned_ports)?;
+    if let Some((host, _)) = pinned_ports
+        .iter()
+        .find(|(host, _)| host_ports.contains(host))
+    {
+        return Err(ApiError::Conflict(format!(
+            "host port {host} is already pinned by another branch of '{golden}'"
+        )));
+    }
     crate::api::handlers::validate_fork_secrets(&req.secrets)?;
     let fork_env = crate::util::parse_request_env_list(&req.env).map_err(ApiError::BadRequest)?;
     crate::agent::fork::validate_fork_env(&fork_env)
@@ -4434,6 +4523,7 @@ async fn check_queued_branch(
             req.name
         )));
     }
+    host_ports.extend(pinned_ports.iter().map(|(host, _)| *host));
     Ok(fork_env)
 }
 
@@ -4489,26 +4579,7 @@ async fn fork_machine_transaction(
         )));
     }
 
-    // Validate pinned ports as the create path does: fork uses these host ports
-    // as-is (no remapping), so port 0 or a duplicated host port would otherwise
-    // surface only as a confusing clone-boot bind failure instead of a clean 400.
-    for (h, g) in &pinned_ports {
-        if *h == 0 || *g == 0 {
-            return Err(ApiError::BadRequest(
-                "port 0 is not valid for VM port forwarding".to_string(),
-            ));
-        }
-    }
-    {
-        let mut seen = std::collections::HashSet::new();
-        for (h, _) in &pinned_ports {
-            if !seen.insert(*h) {
-                return Err(ApiError::BadRequest(format!(
-                    "duplicate host port {h}: each host port can only be mapped once"
-                )));
-            }
-        }
-    }
+    validate_pinned_ports(&pinned_ports)?;
 
     // A failed clone finalization may need to roll back the golden and discard
     // the retained checkpoint that produced it. Keep that state transition in
@@ -5479,6 +5550,9 @@ pub async fn sync_machine(
     if record.staged_mounts.is_empty() {
         return Ok(Json(record_to_info(&name, &record)));
     }
+    if let Some(error) = crate::staged_mount::refuse_detached_sync(&record, &name) {
+        return Err(ApiError::Conflict(error.to_string()));
+    }
     if crate::agent::state_probe::resolve_state(&name, &record) != RecordState::Running {
         return Err(ApiError::Conflict(format!(
             "machine '{name}' must be running to synchronize staged mounts"
@@ -5681,6 +5755,62 @@ pub(crate) async fn delete_one(
     .await
 }
 
+/// Remove a stopped machine's data directory, retrying while something is
+/// still adding entries to it. A delete under heavy guest I/O has failed with
+/// "Directory not empty" and then succeeded seconds later, so the writer
+/// settles: retry for a short while, and name what was left each time so the
+/// writer can be found.
+fn remove_data_dir_settling(name: &str, data_dir: &std::path::Path) -> std::io::Result<()> {
+    const ATTEMPTS: u32 = 6;
+    let mut attempt = 1;
+    loop {
+        match std::fs::remove_dir_all(data_dir) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::DirectoryNotEmpty && attempt < ATTEMPTS =>
+            {
+                tracing::warn!(
+                    machine = name,
+                    attempt,
+                    left = %data_dir_entries(data_dir).join(", "),
+                    "machine data directory gained entries while it was removed; retrying"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(250 << attempt.min(4)));
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Up to 20 paths still under `dir`, relative to it, for a removal diagnostic.
+fn data_dir_entries(dir: &std::path::Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            found.push(
+                path.strip_prefix(dir)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string(),
+            );
+            if found.len() >= 20 {
+                return found;
+            }
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                pending.push(path);
+            }
+        }
+    }
+    found
+}
+
 // Called with the lifecycle and fork-source locks held, after confirmed shutdown.
 // Keep filesystem and database I/O on the blocking thread.
 fn remove_machine_data_and_record(
@@ -5693,7 +5823,7 @@ fn remove_machine_data_and_record(
             // Shutdown was confirmed before entering this helper. Release the
             // uid before removing its .vm-uid file, as in CLI deletion.
             crate::process::free_vm_uid(&crate::agent::vm_uid_registry_dir(), data_dir);
-            std::fs::remove_dir_all(data_dir).map_err(|error| {
+            remove_data_dir_settling(name, data_dir).map_err(|error| {
                 ApiError::internal(format!(
                     "failed to remove data for machine '{name}': {error}; repair host storage and retry deletion"
                 ))
@@ -6260,6 +6390,19 @@ fn file_sha256(path: &std::path::Path) -> Result<String, ApiError> {
 /// Largest cache base a create may fetch.
 const MAX_CACHE_BASE_BYTES: u64 = 512 << 30;
 
+/// The lock a fetch of `base` holds, shared by every create that needs it.
+fn cache_base_fetch_lock(base: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .entry(base.to_string())
+        .or_default()
+        .clone()
+}
+
 /// Fetch a requested cache base this server does not have yet from its signed
 /// source URL, verified against its SHA-256 before it appears under its name.
 /// A base already present is used as is: bases are immutable by name.
@@ -6267,7 +6410,6 @@ async fn fetch_cache_base(
     state: &ApiState,
     spec: &crate::api::types::CacheDiskSpec,
 ) -> Result<(), ApiError> {
-    use sha2::Digest;
     let dir = state.cache_disk_dir()?;
     crate::data::disk::validate_base_name(&spec.base).map_err(ApiError::BadRequest)?;
     let target = dir.join(&spec.base);
@@ -6286,66 +6428,46 @@ async fn fetch_cache_base(
             ApiError::BadRequest("cacheDisk.sourceUrl needs a hex sha256 to verify against".into())
         })?;
     let url = checked_checkpoint_source(raw)?;
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(30))
-        .read_timeout(Duration::from_secs(120))
-        .build()
-        .map_err(|e| ApiError::internal(format!("build cache base fetch client: {e}")))?;
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| ApiError::internal(format!("fetch cache base: {}", e.without_url())))?;
-    if !response.status().is_success() {
-        return Err(ApiError::BadRequest(format!(
-            "cache base source url returned {}",
-            response.status()
-        )));
-    }
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    let partial = dir.join(format!(
-        ".{}.{}.{stamp}.partial",
-        spec.base,
-        std::process::id()
-    ));
-    let result = async {
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&partial)
-            .await
-            .map_err(|e| ApiError::internal(format!("create {}: {e}", partial.display())))?;
-        let mut hasher = sha2::Sha256::new();
-        let mut received = 0_u64;
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk
-                .map_err(|e| ApiError::internal(format!("read cache base: {}", e.without_url())))?;
-            received += chunk.len() as u64;
-            if received > MAX_CACHE_BASE_BYTES {
-                return Err(ApiError::BadRequest(format!(
-                    "cache base exceeds {MAX_CACHE_BASE_BYTES} bytes"
-                )));
-            }
-            hasher.update(&chunk);
-            file.write_all(&chunk)
-                .await
-                .map_err(|e| ApiError::internal(format!("write cache base: {e}")))?;
+    // One download per base, in a task of its own: a create that needs a base
+    // another create is already fetching waits for it instead of fetching it
+    // again, and a create whose caller gave up waiting leaves the download
+    // running, so the retry finds the base instead of starting over.
+    let lock = cache_base_fetch_lock(&spec.base);
+    let base = spec.base.clone();
+    let fetch = tokio::spawn(async move {
+        let _fetching = lock.lock_owned().await;
+        if target.exists() {
+            return Ok(());
         }
-        file.sync_all()
-            .await
-            .map_err(|e| ApiError::internal(format!("sync cache base: {e}")))?;
-        let actual = format!("{:x}", hasher.finalize());
+        // Under the lock no other fetch of this base runs in this server, so
+        // any partial download of it left behind is abandoned.
+        remove_abandoned_partials(&dir, &base);
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(30))
+            .read_timeout(Duration::from_secs(120))
+            .build()
+            .map_err(|e| ApiError::internal(format!("build cache base fetch client: {e}")))?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let partial =
+            PartialDownload(dir.join(format!(".{base}.{}.{stamp}.partial", std::process::id())));
+        let actual = crate::api::cache_base_fetch::download(
+            &client,
+            &url,
+            &partial.0,
+            MAX_CACHE_BASE_BYTES,
+            Default::default(),
+        )
+        .await?;
         if actual != expected {
             return Err(ApiError::BadRequest(format!(
                 "cache base sha256 is {actual}, expected {expected}"
             )));
         }
-        match std::fs::hard_link(&partial, &target) {
+        match std::fs::hard_link(&partial.0, &target) {
             // Verified as it arrived, so a checkpoint of a machine on it need
             // not hash it again.
             Ok(()) => {
@@ -6359,10 +6481,52 @@ async fn fetch_cache_base(
                 target.display()
             ))),
         }
+    });
+    fetch
+        .await
+        .map_err(|e| ApiError::internal(format!("cache base fetch task: {e}")))?
+}
+
+/// A cache base download in progress, removed when the fetch ends however it
+/// ends; a fetch that succeeded has linked it into place first.
+struct PartialDownload(std::path::PathBuf);
+
+impl Drop for PartialDownload {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
-    .await;
-    let _ = std::fs::remove_file(&partial);
-    result
+}
+
+/// Remove partial downloads of `base` in `dir`: `.<base>.<pid>.<stamp>.partial`.
+fn remove_abandoned_partials(dir: &std::path::Path, base: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!(".{base}.");
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let is_partial_of_base = name
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(".partial"))
+            .and_then(|rest| rest.split_once('.'))
+            .is_some_and(|(pid, stamp)| {
+                !pid.is_empty()
+                    && !stamp.is_empty()
+                    && pid.bytes().all(|b| b.is_ascii_digit())
+                    && stamp.bytes().all(|b| b.is_ascii_digit())
+            });
+        if is_partial_of_base {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => tracing::info!(file = name, "removed an abandoned cache base download"),
+                Err(e) => {
+                    tracing::warn!(file = name, error = %e, "could not remove an abandoned cache base download")
+                }
+            }
+        }
+    }
 }
 
 /// Flatten `top` into `dir/base`: written to a hidden partial file, then
@@ -6476,6 +6640,7 @@ pub async fn update_machine_egress(
         remove_allow_cidrs: normalize(&req.remove_allow_cidrs)?,
         outbound_localhost_only: req.outbound_localhost_only,
         allow_all: req.allow_all,
+        reset_allow_list: req.reset_allow_list,
     };
 
     let next = record
@@ -6864,6 +7029,118 @@ mod tests {
     use crate::db::SmolvmDb;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    #[test]
+    fn only_partial_downloads_of_the_base_are_removed() {
+        let dir = TempDir::new().unwrap();
+        let names = [
+            ".cdisk-1-v1.qcow2.4242.1791794701210442779.partial",
+            ".cdisk-1-v1.qcow2.17.99.partial",
+            ".cdisk-1-v12.qcow2.4242.1791794701210442779.partial",
+            ".cdisk-1-v1.qcow2.sha256",
+            "cdisk-1-v1.qcow2",
+            ".cdisk-1-v1.qcow2.oops.partial",
+        ];
+        for name in names {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        remove_abandoned_partials(dir.path(), "cdisk-1-v1.qcow2");
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                ".cdisk-1-v1.qcow2.oops.partial",
+                ".cdisk-1-v1.qcow2.sha256",
+                ".cdisk-1-v12.qcow2.4242.1791794701210442779.partial",
+                "cdisk-1-v1.qcow2",
+            ]
+        );
+    }
+
+    fn branch_request(json: serde_json::Value) -> ForkRequest {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn branches_with_pinned_ports_share_their_source_transaction() {
+        let ported = branch_request(serde_json::json!({
+            "name": "child",
+            "ports": [{"host": 31028, "guest": 4318}]
+        }));
+        assert!(coalescable_branch(&ported));
+        let held = branch_request(serde_json::json!({"name": "slot", "hold": true}));
+        assert!(!coalescable_branch(&held));
+    }
+
+    #[test]
+    fn pinned_ports_reject_port_zero_and_a_repeated_host_port() {
+        assert!(validate_pinned_ports(&[(31028, 4318), (31029, 8080)]).is_ok());
+        assert!(matches!(
+            validate_pinned_ports(&[(0, 4318)]),
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(matches!(
+            validate_pinned_ports(&[(31028, 0)]),
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(matches!(
+            validate_pinned_ports(&[(31028, 4318), (31028, 8080)]),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn api_local_images_need_the_local_image_dir_and_stay_inside_it() {
+        let (_db_dir, state) = setup_test_state();
+        let bad = |result: Result<String, ApiError>| matches!(result, Err(ApiError::BadRequest(_)));
+        assert_eq!(
+            resolve_api_image(&state, "alpine:3.20".into())
+                .await
+                .unwrap(),
+            "alpine:3.20"
+        );
+        assert!(bad(resolve_api_image(&state, "-".into()).await));
+
+        let images = TempDir::new().unwrap();
+        let rootfs = images.path().join("rootfs");
+        std::fs::create_dir(&rootfs).unwrap();
+        let outside = TempDir::new().unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), images.path().join("escape")).unwrap();
+
+        // No --local-image-dir: every local path is refused.
+        assert!(bad(
+            resolve_api_image(&state, rootfs.display().to_string()).await
+        ));
+
+        state.set_local_image_dir(Some(images.path().canonicalize().unwrap()));
+        let accepted = resolve_api_image(&state, rootfs.display().to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            accepted,
+            format!("local-dir:{}", rootfs.canonicalize().unwrap().display())
+        );
+        for refused in [
+            "/".to_string(),
+            outside.path().display().to_string(),
+            format!("{}/../", images.path().display()),
+            images.path().join("escape").display().to_string(),
+            images.path().join("missing.tar").display().to_string(),
+            format!("local-dir:{}", rootfs.display()),
+            "local-dir:/".to_string(),
+            "local:../../..".to_string(),
+        ] {
+            assert!(
+                bad(resolve_api_image(&state, refused.clone()).await),
+                "{refused} must be refused"
+            );
+        }
+    }
 
     #[test]
     fn start_body_is_optional_even_with_a_json_content_type() {
@@ -7627,6 +7904,46 @@ mod tests {
         remove_machine_data_and_record(&recovered, name, &data_dir).unwrap();
         assert!(!data_dir.exists());
         assert!(recovered.db().get_vm(name).unwrap().is_none());
+    }
+
+    /// Something still writing into a machine's data directory while it is
+    /// removed makes the removal see a directory that is not empty; once the
+    /// writer stops, the retry removes everything.
+    #[test]
+    fn delete_cleanup_outlasts_a_writer_that_settles() {
+        let (dir, state) = setup_test_state();
+        let name = "cleanup-busy";
+        create_test_vm(state.db(), name, Some(20), Some(5));
+        let data_dir = dir.path().join("machine-data");
+        std::fs::create_dir_all(data_dir.join("nested")).unwrap();
+        for index in 0..200 {
+            std::fs::write(data_dir.join("nested").join(format!("f{index}")), b"x").unwrap();
+        }
+        let writing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let writer = {
+            let (data_dir, writing) = (data_dir.clone(), writing.clone());
+            std::thread::spawn(move || {
+                let mut index = 0u64;
+                while writing.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = std::fs::create_dir_all(data_dir.join("nested"));
+                    let _ = std::fs::write(data_dir.join("nested").join(format!("w{index}")), b"x");
+                    index += 1;
+                }
+            })
+        };
+        let stop = {
+            let writing = writing.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(600));
+                writing.store(false, std::sync::atomic::Ordering::Relaxed);
+            })
+        };
+        remove_machine_data_and_record(&state, name, &data_dir).unwrap();
+        stop.join().unwrap();
+        writer.join().unwrap();
+        // The writer may recreate a stray entry after the final pass returned;
+        // the record is gone either way.
+        assert!(state.db().get_vm(name).unwrap().is_none());
     }
 
     #[test]
