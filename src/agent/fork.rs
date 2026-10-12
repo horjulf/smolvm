@@ -605,9 +605,10 @@ fn branch_admission_required_mib(
 
 /// Refuse a fan-out before capture if it would consume the host/cgroup's safe
 /// boot headroom. This intentionally reserves only measured VMM boot overhead
-/// plus a fresh shared generation—not every child's configured guest ceiling,
-/// which would erase COW density. Managed per-VM cgroups remain the hard bound
-/// for later workload writes where the service enables them.
+/// plus what a fresh shared generation copies—the source's private pages since
+/// its last capture, not its whole RAM and not every child's configured guest
+/// ceiling, which would erase COW density. Managed per-VM cgroups remain the
+/// hard bound for later workload writes where the service enables them.
 fn admit_branch_memory(
     record: &VmRecord,
     children: usize,
@@ -632,7 +633,7 @@ fn admit_branch_memory(
         record
             .pid
             .and_then(crate::process::process_memory_stats)
-            .and_then(|stats| stats.pss_bytes)
+            .and_then(|stats| stats.anon_bytes.or(stats.pss_bytes))
             .map(|bytes| (bytes.saturating_add(MIB - 1)) / MIB)
             .unwrap_or(u64::from(record.mem))
             .min(u64::from(record.mem))
@@ -1956,6 +1957,26 @@ fn read_generation_fork_disks(snapshot_dir: &Path) -> Result<Option<Vec<ForkDisk
 /// have succeeded, so the limit only catches a guest whose disk is wedged.
 const SYNC_FORK_SOURCE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Keep a source's staged mounts on its branch without their host binding.
+///
+/// The branch's cloned storage disk already holds the working copies; keeping
+/// the mounts recorded makes a restart find and keep them instead of pruning
+/// them as stale. What a branch must not do is synchronize them back: the host
+/// directories are the source's, and two descendants writing one tree would
+/// interleave their changes. `staged_mounts_detached_from` names the machine
+/// that still may, through every generation of branches.
+pub(crate) fn detach_staged_mounts(clone_rec: &mut VmRecord, golden: &str, golden_rec: &VmRecord) {
+    if golden_rec.staged_mounts.is_empty() {
+        return;
+    }
+    clone_rec.staged_mounts_detached_from = Some(
+        golden_rec
+            .staged_mounts_detached_from
+            .clone()
+            .unwrap_or_else(|| golden.to_string()),
+    );
+}
+
 /// Flush guest filesystems before capturing a new live checkpoint.
 ///
 /// A branch sees dirty guest page-cache state through the RAM snapshot, but a
@@ -2307,12 +2328,6 @@ pub(crate) fn prepare_forks_reusing(
     for spec in specs {
         check_pinned_ports_keep_network_backend(golden, &golden_rec, spec.pinned_ports)?;
     }
-    if !golden_rec.staged_mounts.is_empty() {
-        return Err(Error::config(
-            "fork",
-            "staged mounts cannot be branched yet because multiple descendants would synchronize into the same host directory; use a live rw mount or remove the staged mount first",
-        ));
-    }
     let child_depth = db
         .fork_lineage_depth(golden)?
         .checked_add(1)
@@ -2526,8 +2541,8 @@ pub(crate) fn prepare_forks_reusing(
 
         let t_snap = std::time::Instant::now();
         tracing::info!(%golden, phase = "memory_reserved", elapsed_ms = preparation_started.elapsed().as_millis() as u64, "fork preparation progress");
-        // Active children map one sparse materialized memfd generation so CPU-
-        // and I/O-heavy work never serializes behind page-by-page delivery.
+        // Active children map one shared immutable generation so CPU- and
+        // I/O-heavy work never serializes behind page-by-page delivery.
         // Held pool slots use the same shared generation because they may run a
         // dense workload as soon as they are leased. The environment override
         // remains an operator and debugging escape hatch.
@@ -2936,11 +2951,13 @@ fn prepare_clone_from_snapshot(
                 .to_string(),
         );
         clone_rec.golden = Some(golden.to_string());
+        detach_staged_mounts(&mut clone_rec, golden, golden_rec);
         clone_rec.fork_generation = snapshot_generation_id(snapshot_dir).map(str::to_string);
         clone_rec.fork_lineage_pid_start_time = None;
-        // Forkability is explicit per clone. A normal clone remains a cheap
-        // leaf; a forkable clone materializes its restored RAM into fresh
-        // backing files at boot so it can later checkpoint its own state.
+        // Forkability is explicit per clone. Either way the clone is a
+        // copy-on-write view of its source's generation; a forkable clone
+        // additionally gets a control socket, and branching it later captures
+        // only the pages it has written since.
         clone_rec.forkable = spec.clone_forkable;
         clone_rec.forkpoint_held = spec.hold;
         clone_rec.fork_env = spec.fork_env.to_vec();
@@ -4066,6 +4083,30 @@ fn check_pinned_ports_keep_network_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_branch_keeps_staged_mounts_but_not_their_host_binding() {
+        let mut source = VmRecord::new("src".into(), 1, 512, vec![], vec![], false);
+        source.staged_mounts = vec![(0, "/home/me/project".into(), "/workspace".into())];
+        let mut child = source.clone();
+        detach_staged_mounts(&mut child, "src", &source);
+        assert_eq!(child.staged_mounts, source.staged_mounts);
+        assert_eq!(child.staged_mounts_detached_from.as_deref(), Some("src"));
+        assert!(source.staged_mounts_sync_to_host());
+        assert!(!child.staged_mounts_sync_to_host());
+        // A branch of the branch still names the original owner.
+        let mut grandchild = child.clone();
+        detach_staged_mounts(&mut grandchild, "child", &child);
+        assert_eq!(
+            grandchild.staged_mounts_detached_from.as_deref(),
+            Some("src")
+        );
+        // No staged mounts: nothing to detach.
+        let plain = VmRecord::new("p".into(), 1, 512, vec![], vec![], false);
+        let mut plain_child = plain.clone();
+        detach_staged_mounts(&mut plain_child, "p", &plain);
+        assert!(plain_child.staged_mounts_detached_from.is_none());
+    }
 
     #[test]
     fn pinned_ports_need_a_golden_already_on_the_port_capable_backend() {

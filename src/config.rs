@@ -385,6 +385,13 @@ pub struct EgressUpdate {
     /// Permit a removal that empties the list, which allows egress to every
     /// host (`--net` on the CLI, `allowAll` on the API).
     pub allow_all: bool,
+    /// Start from an empty allow list before applying this update's additions,
+    /// so the machine ends up with exactly what the update names and nothing
+    /// it allowed before (`--reset-allow-list` on the CLI, `resetAllowList` on
+    /// the API). A reset that names nothing still needs `allow_all` to open
+    /// egress; it cannot be combined with removals, which would have nothing
+    /// to remove.
+    pub reset_allow_list: bool,
 }
 
 impl EgressUpdate {
@@ -396,6 +403,7 @@ impl EgressUpdate {
             && !self.outbound_localhost_only
             && self.remove_allow_hosts.is_empty()
             && self.remove_allow_cidrs.is_empty()
+            && !self.reset_allow_list
     }
 }
 
@@ -465,6 +473,15 @@ pub struct VmRecord {
     /// live writable virtiofs mount.
     #[serde(default)]
     pub staged_mounts: Vec<(usize, String, String)>,
+
+    /// The fork source whose host directories this branch's staged working
+    /// copies were seeded from. A branch keeps the copies (they live on its own
+    /// cloned storage disk and survive restarts, since the mounts stay
+    /// recorded) but never synchronizes them back: the host directories belong
+    /// to the source, and two descendants writing one tree would interleave
+    /// their changes. Inherited by the branch's own branches.
+    #[serde(default)]
+    pub staged_mounts_detached_from: Option<String>,
 
     /// Port mappings (host_port, guest_port).
     #[serde(default)]
@@ -862,6 +879,7 @@ impl VmRecord {
             cache_disk: None,
             mounts,
             staged_mounts: Vec::new(),
+            staged_mounts_detached_from: None,
             ports,
             published_sockets: Vec::new(),
             network,
@@ -953,6 +971,7 @@ impl VmRecord {
             cache_disk: None,
             mounts,
             staged_mounts: Vec::new(),
+            staged_mounts_detached_from: None,
             ports,
             published_sockets: Vec::new(),
             network,
@@ -1093,14 +1112,20 @@ impl VmRecord {
     }
 
     /// Whether this machine's registry image must be fetched on the HOST before
-    /// it boots: a REGISTRY reference, on a first boot, with no network.
+    /// it boots: a REGISTRY reference, on a first boot, that the guest's own
+    /// network cannot reach: no network, an inbound-only network (published
+    /// ports without egress), or an egress allow list that does not name the
+    /// registry.
     ///
     /// The pull normally runs inside the guest (the agent shells out to
-    /// `crane`), so a machine with no network device cannot fetch its own image.
-    /// Rather than refuse such a machine, the start path fetches the image on the
-    /// host, which has network, and pins it as a local archive the guest
-    /// flattens offline (see [`crate::image_store::fetch_image_archive`]). The
-    /// machine itself never gets network.
+    /// `crane`). Rather than refuse such a machine, the start path fetches the
+    /// image on the host, which has network, and pins it as a local archive the
+    /// guest flattens offline (see [`crate::image_store::fetch_image_archive`]).
+    /// The machine's own network policy is untouched: the pull is the engine's,
+    /// not the workload's, exactly as for a machine with no network at all. An
+    /// allow list that does name the registry (and, for Docker Hub and GHCR,
+    /// the hosts they serve downloads from) keeps the pull in the guest, where
+    /// the operator chose to route it.
     ///
     /// Deliberately narrow: only a registry reference needs fetching. A local
     /// archive or directory is already on the host, a `.smolmachine` has its
@@ -1128,7 +1153,43 @@ impl VmRecord {
         matches!(
             crate::data::image_source::classify(image),
             crate::data::image_source::ImageSource::Registry(_)
-        ) && !self.launch_network_plan().has_network()
+        ) && !self.guest_can_pull(image)
+    }
+
+    /// Whether the guest's own network reaches `image`'s registry: outbound
+    /// egress with no policy at all, or an allow list that names every apex the
+    /// pull talks to ([`crate::registry::registry_pull_hosts`]), either the apex
+    /// itself or its subdomains, since registries answer from sub-hosts.
+    /// `Some([])` is a deny-all list, not an absent one, and a CIDR-only list
+    /// cannot be checked against hostnames here, so both send the pull to the
+    /// host rather than guess.
+    fn guest_can_pull(&self, image: &str) -> bool {
+        use smolvm_protocol::host_pattern::matches;
+        if !self.launch_network_plan().outbound {
+            return false;
+        }
+        if self.dns_filter_hosts.is_none()
+            && self.allowed_cidrs.is_none()
+            && self.egress_rules.is_empty()
+        {
+            return true;
+        }
+        let hosts = self.dns_filter_hosts.as_deref().unwrap_or(&[]);
+        crate::registry::registry_pull_hosts(image)
+            .iter()
+            .all(|apex| {
+                let apex = apex.split(':').next().unwrap_or(apex);
+                let sub_host = format!("pull.{apex}");
+                hosts
+                    .iter()
+                    .any(|entry| matches(apex, entry) || matches(&sub_host, entry))
+            })
+    }
+
+    /// Whether this machine's staged mounts synchronize back to their host
+    /// directories. False on a branch, which only keeps the working copies.
+    pub fn staged_mounts_sync_to_host(&self) -> bool {
+        self.staged_mounts_detached_from.is_none()
     }
 
     /// Whether this machine's image can be fetched. Always: a machine with no
@@ -1298,8 +1359,10 @@ impl VmRecord {
     /// This record after one add/remove amendment of its egress allow list, or
     /// `None` when the update is empty. Hosts are stored as `machine create`
     /// stores them: `allow_hosts` bare (a name and its subdomains),
-    /// `allow_host_patterns` strict-encoded. Removing the last entry would open
-    /// egress to every host, so that needs `allow_all` to say so. Shared by
+    /// `allow_host_patterns` strict-encoded. `reset_allow_list` drops the stored
+    /// list first, so the result is exactly the update's additions. Removing or
+    /// resetting away the last entry would open egress to every host, so that
+    /// needs `allow_all` to say so. Shared by
     /// `machine update` and the API's egress endpoint; the full replace-style
     /// checks (credentials, TSI, saved memory) run in [`Self::replace_egress`].
     pub fn updated_egress(&self, update: &EgressUpdate) -> Result<Option<VmRecord>> {
@@ -1310,6 +1373,18 @@ impl VmRecord {
         let mut hosts = self.dns_filter_hosts.clone().unwrap_or_default();
         let mut cidrs = self.allowed_cidrs.clone().unwrap_or_default();
         let was_restricted = !hosts.is_empty() || !cidrs.is_empty();
+
+        if update.reset_allow_list {
+            if !update.remove_allow_hosts.is_empty() || !update.remove_allow_cidrs.is_empty() {
+                return Err(crate::Error::config(
+                    "update",
+                    "resetting the allow list replaces it, so there is nothing for a removal \
+                     to remove; name the full new list instead",
+                ));
+            }
+            hosts.clear();
+            cidrs.clear();
+        }
 
         for host in &update.remove_allow_hosts {
             let strict = encode_strict(host.trim()).ok();
@@ -1462,6 +1537,70 @@ mod tests {
     }
 
     #[test]
+    fn updated_egress_reset_replaces_the_list_and_keeps_the_last_entry_guard() {
+        let mut record = VmRecord::new("e".to_string(), 1, 512, vec![], vec![], true);
+        record.dns_filter_hosts =
+            Some(vec!["old.example".to_string(), "*.old.example".to_string()]);
+        record.allowed_cidrs = Some(vec!["10.0.0.0/8".to_string()]);
+
+        // A reset alone is a change, not a no-op, and it would open egress, so
+        // it needs allow_all like a removal of the last entry does.
+        let err = record
+            .updated_egress(&EgressUpdate {
+                reset_allow_list: true,
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("every host"), "{err}");
+
+        // Reset with additions: exactly the additions remain, nothing older.
+        let next = record
+            .updated_egress(&EgressUpdate {
+                reset_allow_list: true,
+                allow_host_patterns: vec!["pypi.org".to_string(), "*.npmjs.org".to_string()],
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        let hosts = next.dns_filter_hosts.clone().unwrap();
+        assert_eq!(hosts.len(), 2);
+        assert!(
+            !hosts.iter().any(|h| h.contains("old.example")),
+            "{hosts:?}"
+        );
+        assert!(next.allowed_cidrs.as_deref().unwrap_or_default().is_empty());
+
+        // Reset plus allow_all: an open machine, no list at all.
+        let open = record
+            .updated_egress(&EgressUpdate {
+                reset_allow_list: true,
+                allow_all: true,
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        assert!(open
+            .dns_filter_hosts
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty());
+        assert!(open.allowed_cidrs.as_deref().unwrap_or_default().is_empty());
+
+        // Reset and removal contradict each other.
+        let err = record
+            .updated_egress(&EgressUpdate {
+                reset_allow_list: true,
+                remove_allow_hosts: vec!["old.example".to_string()],
+                allow_hosts: vec!["new.example".to_string()],
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("replaces"), "{err}");
+    }
+
+    #[test]
     fn updated_egress_merges_dedupes_and_guards_the_last_entry() {
         let mut record = VmRecord::new("e".to_string(), 1, 512, vec![], vec![], true);
         record.allowed_cidrs = Some(vec!["10.0.0.0/8".to_string()]);
@@ -1583,18 +1722,57 @@ mod tests {
     }
 
     #[test]
-    fn granting_network_any_way_leaves_the_pull_to_the_guest() {
-        // Explicit --net.
+    fn open_egress_leaves_the_pull_to_the_guest() {
         assert!(!rec_with_image("alpine", true, vec![]).image_needs_host_fetch());
-        // A published port implicitly enables networking.
-        assert!(!rec_with_image("alpine", false, vec![(8080, 80)]).image_needs_host_fetch());
-        // An egress policy also forces a network backend.
+    }
+
+    // The guest pulls with its own network, so a network that cannot reach the
+    // registry is as good as none: the host fetches.
+    #[test]
+    fn a_guest_whose_network_cannot_reach_the_registry_gets_a_host_fetch() {
+        // Published ports give an inbound path, not egress.
+        assert!(rec_with_image("alpine", false, vec![(8080, 80)]).image_needs_host_fetch());
+        // An allow list that does not name the registry, by CIDR or by host.
         let mut cidr = rec_with_image("alpine", false, vec![]);
         cidr.allowed_cidrs = Some(vec!["10.0.0.0/8".to_string()]);
-        assert!(!cidr.image_needs_host_fetch());
+        assert!(cidr.image_needs_host_fetch());
         let mut dns = rec_with_image("alpine", false, vec![]);
         dns.dns_filter_hosts = Some(vec!["example.com".to_string()]);
-        assert!(!dns.image_needs_host_fetch());
+        assert!(dns.image_needs_host_fetch());
+        // A deny-all list is a list.
+        let mut deny = rec_with_image("alpine", true, vec![]);
+        deny.dns_filter_hosts = Some(vec![]);
+        assert!(deny.image_needs_host_fetch());
+        // Docker Hub redirects blobs to another host; naming only docker.io
+        // would fail mid-pull in the guest.
+        let mut hub = rec_with_image("alpine", true, vec![]);
+        hub.dns_filter_hosts = Some(vec!["docker.io".to_string()]);
+        assert!(hub.image_needs_host_fetch());
+    }
+
+    #[test]
+    fn an_allow_list_naming_the_registry_keeps_the_pull_in_the_guest() {
+        // Both Docker Hub apexes, as `registry_pull_hosts` names them.
+        let mut hub = rec_with_image("alpine", true, vec![]);
+        hub.dns_filter_hosts = Some(vec!["docker.io".to_string(), "docker.com".to_string()]);
+        assert!(!hub.image_needs_host_fetch());
+        // Wildcards cover the sub-hosts a registry answers from.
+        let mut wild = rec_with_image("alpine", true, vec![]);
+        wild.dns_filter_hosts = Some(vec!["*.docker.io".to_string(), "*.docker.com".to_string()]);
+        assert!(!wild.image_needs_host_fetch());
+        // GHCR redirects blobs to githubusercontent.com; both apexes are needed.
+        let mut ghcr = rec_with_image("ghcr.io/acme/app:1", true, vec![]);
+        ghcr.dns_filter_hosts = Some(vec!["=ghcr.io".to_string()]);
+        assert!(ghcr.image_needs_host_fetch());
+        ghcr.dns_filter_hosts = Some(vec![
+            "=ghcr.io".to_string(),
+            "githubusercontent.com".to_string(),
+        ]);
+        assert!(!ghcr.image_needs_host_fetch());
+        // A registry with a port is matched by host.
+        let mut private = rec_with_image("registry.example.com:5000/team/app:2", true, vec![]);
+        private.dns_filter_hosts = Some(vec!["*.example.com".to_string()]);
+        assert!(!private.image_needs_host_fetch());
     }
 
     // These resolve from bytes the host already has.

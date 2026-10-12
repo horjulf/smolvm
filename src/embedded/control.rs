@@ -117,7 +117,7 @@ impl MachineSpec {
 
 /// Create a DB record for a new SDK machine.
 pub fn create_vm(db: &SmolvmDb, spec: &MachineSpec) -> Result<()> {
-    create_vm_with_workload(db, spec, Vec::new(), None, None)
+    create_vm_with_workload(db, spec, Vec::new(), None, None, None)
 }
 
 /// Create a DB record with the image workload configuration supplied by an
@@ -128,10 +128,45 @@ pub(crate) fn create_vm_with_workload(
     env: Vec<(String, String)>,
     workdir: Option<String>,
     user: Option<String>,
+    credentials: Option<&crate::credentials::CredentialPolicy>,
 ) -> Result<()> {
     validate_vm_name(&spec.name, "name")
         .map_err(|reason| Error::config("validate machine name", reason))?;
+    for port in &spec.ports {
+        if port.host == 0 || port.guest == 0 {
+            return Err(Error::config(
+                "validate published ports",
+                "port 0 is not valid for VM port forwarding",
+            ));
+        }
+    }
+    PortMapping::check_duplicates(&spec.ports)
+        .map_err(|reason| Error::config("validate published ports", reason))?;
     let mut record = spec.to_record();
+    if let Some(policy) = credentials.filter(|p| !p.is_empty()) {
+        // A credential only ever travels over the network the machine has; it
+        // grants none. Refuse rather than create a machine whose requests
+        // could never be made.
+        let has_egress = spec.resources.network
+            || !spec.allowed_hosts.is_empty()
+            || spec
+                .resources
+                .allowed_cidrs
+                .as_ref()
+                .is_some_and(|cidrs| !cidrs.is_empty());
+        if !has_egress {
+            return Err(Error::config(
+                "credentials",
+                "credential bindings need network egress; enable network or allow the hosts",
+            ));
+        }
+        let allow_hosts = (!spec.allowed_hosts.is_empty()).then_some(spec.allowed_hosts.as_slice());
+        record.credential_placeholders = crate::credentials::prepare_policy(policy, allow_hosts)?;
+        record.credential_policy = Some(policy.clone());
+        // Values come only from `supply_credential_values`, never from this
+        // host's environment: an embedder decides what each machine may use.
+        record.credentials_supplied_by_api = true;
+    }
     if let Some(cidrs) = &spec.resources.allowed_cidrs {
         record.allowed_cidrs = Some(
             cidrs
@@ -851,14 +886,17 @@ mod tests {
     }
 
     fn test_db() -> SmolvmDb {
+        // The clock alone is not unique: macOS reports microseconds, so tests
+        // running in parallel can read the same instant and share one file.
+        static NEXT_DB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let sequence = NEXT_DB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "smolvm-embedded-control-{}-{}.db",
+            "smolvm-embedded-control-{}-{unique}-{sequence}.db",
             std::process::id(),
-            unique
         ));
         SmolvmDb::open_at(&path).unwrap()
     }
@@ -996,7 +1034,8 @@ mod tests {
         let db = test_db();
         let mut spec = test_spec("creds", true);
         spec.credentials = Some(notion_policy(&["api.notion.com", "files.notion.com"]));
-        create_vm_with_workload(&db, &spec, vec![("A".into(), "1".into())], None, None).unwrap();
+        create_vm_with_workload(&db, &spec, vec![("A".into(), "1".into())], None, None, None)
+            .unwrap();
         let record = get_record(&db, "creds").unwrap();
 
         assert!(record.network, "a credential policy implies networking");
@@ -1030,15 +1069,22 @@ mod tests {
         let mut spec = test_spec("creds-outside", true);
         spec.allowed_hosts = vec!["api.github.com".into()];
         spec.credentials = Some(notion_policy(&["api.notion.com"]));
-        assert!(create_vm_with_workload(&db, &spec, Vec::new(), None, None).is_err());
+        assert!(create_vm_with_workload(&db, &spec, Vec::new(), None, None, None).is_err());
         assert!(db.get_vm("creds-outside").unwrap().is_none());
     }
 
     #[test]
     fn a_spec_without_credentials_adds_no_guest_variables() {
         let db = test_db();
-        create_vm_with_workload(&db, &test_spec("plain-env", true), Vec::new(), None, None)
-            .unwrap();
+        create_vm_with_workload(
+            &db,
+            &test_spec("plain-env", true),
+            Vec::new(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let record = get_record(&db, "plain-env").unwrap();
         assert!(record.credential_policy.is_none());
         assert!(credential_env(&record).is_empty());
@@ -1086,6 +1132,7 @@ mod tests {
             vec![("SESSION".into(), "golden".into())],
             Some("/workspace".into()),
             Some("1000:1000".into()),
+            None,
         )
         .unwrap();
         let record = get_record(&db, "workload").unwrap();
@@ -1094,6 +1141,81 @@ mod tests {
         assert_eq!(record.env, vec![("SESSION".into(), "golden".into())]);
         assert_eq!(record.user.as_deref(), Some("1000:1000"));
         assert_eq!(record.workdir.as_deref(), Some("/workspace"));
+    }
+
+    fn header_policy() -> crate::credentials::CredentialPolicy {
+        serde_json::from_str(
+            r#"{"credentials":[{"name":"git","allowed_hosts":["github.com","*.github.com"],
+               "set_header":"authorization"}]}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn credential_bindings_are_recorded_without_values() {
+        let mut spec = test_spec("credentialed", false);
+        spec.resources.network = true;
+        let db = test_db();
+        create_vm_with_workload(&db, &spec, Vec::new(), None, None, Some(&header_policy()))
+            .unwrap();
+        let record = get_record(&db, "credentialed").unwrap();
+        assert_eq!(record.credential_policy, Some(header_policy()));
+        assert!(record.credential_placeholders.contains_key("git"));
+        // An embedder's bindings take values only from what it supplies.
+        assert!(record.credentials_supplied_by_api);
+        let launch = crate::credentials::CredentialLaunch::for_record("credentialed", &record)
+            .expect("a credentialed record launches the interceptor");
+        assert!(launch.supplied_only);
+    }
+
+    #[test]
+    fn embedded_create_rejects_invalid_published_ports_before_persisting() {
+        let db = test_db();
+        for (name, ports, expected) in [
+            ("zero-host", vec![PortMapping::new(0, 8080)], "port 0"),
+            ("zero-guest", vec![PortMapping::new(8080, 0)], "port 0"),
+            (
+                "duplicate-host",
+                vec![PortMapping::new(8080, 80), PortMapping::new(8080, 81)],
+                "duplicate host port",
+            ),
+        ] {
+            let mut spec = test_spec(name, true);
+            spec.ports = ports;
+            let error = create_vm(&db, &spec).unwrap_err();
+            assert!(error.to_string().contains(expected), "{name}: {error}");
+            assert!(get_record(&db, name).is_err(), "{name} was persisted");
+        }
+
+        let mut spec = test_spec("valid-ports", true);
+        spec.ports = vec![PortMapping::new(8080, 80), PortMapping::new(8081, 80)];
+        create_vm(&db, &spec).unwrap();
+        assert_eq!(get_record(&db, "valid-ports").unwrap().ports.len(), 2);
+    }
+
+    #[test]
+    fn credentials_on_a_machine_without_egress_are_refused() {
+        let spec = test_spec("offline-credentialed", false);
+        assert!(!spec.resources.network);
+        let db = test_db();
+        let err =
+            create_vm_with_workload(&db, &spec, Vec::new(), None, None, Some(&header_policy()))
+                .unwrap_err();
+        assert!(err.to_string().contains("network egress"), "{err}");
+        assert!(get_record(&db, "offline-credentialed").is_err());
+
+        // A hostname allow-list that does not cover a credential host is refused too.
+        let mut scoped = test_spec("scoped-credentialed", false);
+        scoped.allowed_hosts = vec!["example.com".into()];
+        assert!(create_vm_with_workload(
+            &db,
+            &scoped,
+            Vec::new(),
+            None,
+            None,
+            Some(&header_policy())
+        )
+        .is_err());
     }
 
     #[test]
@@ -1106,7 +1228,11 @@ mod tests {
         let features = merge_record_launch_features(&record, LaunchFeatures::default());
         assert_eq!(
             features.dns_filter_hosts,
-            Some(vec!["api.example.com".into(), "ghcr.io".into()])
+            Some(vec![
+                "api.example.com".into(),
+                "ghcr.io".into(),
+                "githubusercontent.com".into()
+            ])
         );
 
         record.init_completed = true;

@@ -829,7 +829,7 @@ fn ready_marker_unwritable(_marker: &Path) -> bool {
 /// signal. socket2's `Domain::UNIX` works on unix AND Windows (Win10+), unlike
 /// std's unix-only `UnixListener`, so this builds on every host. Returns None on
 /// any error — readiness then falls back to the marker/ping.
-fn bind_ready_listener(path: &Path) -> Option<socket2::Socket> {
+pub fn bind_ready_listener(path: &Path) -> Option<socket2::Socket> {
     let _ = std::fs::remove_file(path);
     let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).ok()?;
     sock.bind(&socket2::SockAddr::unix(path).ok()?).ok()?;
@@ -1237,7 +1237,7 @@ impl AgentManager {
         // cache dir and use that, so `npm i` / `pip install` is self-contained
         // with no separate engine install. Re-extracts when the tarball changes
         // (a new SDK version ships a newer agent).
-        if let Some(tar) = std::env::var_os("SMOLVM_AGENT_ROOTFS_TAR") {
+        if let Some(tar) = crate::embedded::bundle::agent_rootfs_tar() {
             return Self::ensure_extracted_rootfs(Path::new(&tar));
         }
 
@@ -2433,8 +2433,8 @@ impl AgentManager {
                 shared_setting.as_deref(),
                 external_daemon,
             ) {
-                let daemon_executable = match std::env::var_os("SMOLVM_BOOT_BINARY") {
-                    Some(path) => PathBuf::from(path),
+                let daemon_executable = match crate::embedded::bundle::boot_binary() {
+                    Some(path) => path,
                     None => crate::process::self_exe_for_spawn()
                         .map_err(|error| Error::agent("find smolvm binary", error.to_string()))?,
                 };
@@ -2843,8 +2843,10 @@ impl AgentManager {
         let spawn_start = Instant::now();
         // Embedders (e.g. the Node SDK, where current_exe is `node`) can point the
         // boot subprocess at a `_boot-vm`-capable, signed helper binary instead of self.
-        let boot_binary = std::env::var_os("SMOLVM_BOOT_BINARY");
-        // An in-process embedder (the Node/Python SDK) sets SMOLVM_BOOT_BINARY and
+        // The embedder's registered helper first (`embedded::bundle`), then the
+        // SMOLVM_BOOT_BINARY override a CLI wrapper may set.
+        let boot_binary = crate::embedded::bundle::boot_binary();
+        // An in-process embedder (the Node/Python SDK) registers a boot helper and
         // owns the VM's lifetime — when that host process dies, the VM must die
         // too, or it leaks as an orphan holding the VM's full RAM. The CLI (which
         // detaches the VM on purpose) and `serve` (which reconnects to surviving
@@ -2857,9 +2859,7 @@ impl AgentManager {
         // `features.watch_parent = Some(false)` — otherwise its persistent
         // machines die the moment the CLI process exits.
         let watch_parent = features.watch_parent.unwrap_or(boot_binary.is_some());
-        let boot_exe = boot_binary
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| exe.clone());
+        let boot_exe = boot_binary.unwrap_or_else(|| exe.clone());
         let mut cmd = std::process::Command::new(&boot_exe);
         if let Some(service) = crate::network::launch::guest_host_service()
             .map_err(|reason| Error::config("configure guest rollout ingress", reason))?
@@ -2883,8 +2883,12 @@ impl AgentManager {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             let mut search: Vec<std::path::PathBuf> = Vec::new();
-            if let Some(dir) = std::env::var_os("SMOLVM_LIB_DIR") {
-                search.push(std::path::PathBuf::from(dir));
+            if let Some(dir) = crate::embedded::bundle::lib_dir() {
+                // The boot helper resolves libkrun through SMOLVM_LIB_DIR too, and an
+                // embedder's bundle is not in our environment, so pass it to the
+                // child explicitly. Child-only: nothing else inherits it.
+                cmd.env(crate::data::consts::ENV_SMOLVM_LIB_DIR, &dir);
+                search.push(dir);
             }
             if let Some(parent) = boot_exe.parent() {
                 search.push(parent.to_path_buf());
@@ -3234,17 +3238,23 @@ impl AgentManager {
             || process::is_our_process_strict(pid, start_time)
             || process::cmdline_contains(pid, &self.boot_config_path().to_string_lossy());
 
-        if identity_ok {
+        let exit_confirmed = if identity_ok {
             if !process::is_our_process_strict(pid, start_time) {
                 tracing::debug!(
                     pid,
                     "PID start-time not verified, identity confirmed via vsock"
                 );
             }
-            let _ = process::stop_vm_process(pid, AGENT_STOP_TIMEOUT, process::VM_SIGKILL_TIMEOUT);
-        }
+            // The stop helper observes the kernel's exit event or reaps our
+            // child. On macOS kill(pid, 0) can still see an exited child until
+            // it is reaped, so a second liveness probe must not override that
+            // confirmed exit (or mistake a recycled PID for this VM).
+            process::stop_vm_process(pid, AGENT_STOP_TIMEOUT, process::VM_SIGKILL_TIMEOUT).is_ok()
+        } else {
+            false
+        };
 
-        if process::is_alive(pid) {
+        if !exit_confirmed && process::is_alive(pid) {
             if !identity_ok {
                 // Kill was skipped (no vsock ack, start-time unverifiable) AND the
                 // process is genuinely still alive — a real orphan/leak risk.
@@ -4038,26 +4048,65 @@ mod tests {
         let mut manager = AgentManager::new(temp.path().join("rootfs"), storage, overlay).unwrap();
         // No agent listening, exactly as for a paused guest.
         manager.vsock_socket = temp.path().join("missing-agent.sock");
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
-        let pid = child.id() as crate::process::Pid;
+        // Repeat under CI load to catch intermittent process identity races.
+        for attempt in 0..512 {
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            let pid = child.id() as crate::process::Pid;
 
-        let started = std::time::Instant::now();
-        let result = manager.stop_vm_process(pid, process::process_start_time(pid), true);
-        let elapsed = started.elapsed();
-        let survived = matches!(child.try_wait(), Ok(None));
-        let _ = child.kill();
-        let _ = child.wait();
+            // A freshly spawned child can briefly have no macOS proc_pidinfo
+            // start time. Wait for an identity before testing the strict stop path;
+            // without one the stop correctly refuses to signal an unknown PID.
+            let identity_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let start_time = loop {
+                if let Some(start_time) = process::process_start_time(pid) {
+                    break start_time;
+                }
+                if std::time::Instant::now() >= identity_deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("spawned test child never acquired a verifiable start time");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
 
-        assert!(result.is_ok(), "a paused guest must stop: {result:?}");
-        assert!(!survived, "the paused VM's process must be gone");
-        // The handshake was skipped, not merely fast: its own deadline is 5s.
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "took {elapsed:?}, so the shutdown handshake was still attempted"
-        );
+            let before_start = process::process_start_time(pid);
+            let identity_verified = process::is_our_process_strict(pid, Some(start_time));
+            let started = std::time::Instant::now();
+            let result = manager.stop_vm_process(pid, Some(start_time), true);
+            let elapsed = started.elapsed();
+            let after_start = process::process_start_time(pid);
+            // NOTE_EXIT can arrive just before a child becomes waitable on
+            // macOS. Give the kernel a bounded interval to finish the exit.
+            let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let survived = loop {
+                match child.try_wait() {
+                    Ok(None) if std::time::Instant::now() < reap_deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Ok(None) => break true,
+                    _ => break false,
+                }
+            };
+            let _ = child.kill();
+            let _ = child.wait();
+
+            assert!(
+                result.is_ok(),
+                "iteration={attempt}, a paused guest must stop: {result:?}; start={start_time}, before={before_start:?}, verified={identity_verified}, after={after_start:?}, survived={survived}, elapsed={elapsed:?}"
+            );
+            assert!(
+                !survived,
+                "iteration={attempt}, the paused VM's process must be gone: result={result:?}, start={start_time}, before={before_start:?}, verified={identity_verified}, after={after_start:?}, elapsed={elapsed:?}"
+            );
+            // The handshake was skipped, not merely fast: its own deadline is 5s.
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "took {elapsed:?}, so the shutdown handshake was still attempted"
+            );
+        }
     }
 
     #[cfg(unix)]

@@ -300,6 +300,37 @@ async fn terminate(
 }
 
 impl State {
+    /// Ask the resolver for `binding`'s value for this request. The inner
+    /// `Err` is the reply to send the guest when it has none.
+    async fn resolve(
+        &self,
+        binding: &str,
+        host: &str,
+        destination: SocketAddr,
+        method: &str,
+        path: &str,
+    ) -> Result<std::result::Result<zeroize::Zeroizing<String>, Reply>> {
+        let resolver = self.resolver.clone();
+        let request = CredentialRequest {
+            machine: self.machine.clone(),
+            binding: binding.to_string(),
+            host: host.to_string(),
+            port: destination.port(),
+            method: method.to_string(),
+            path: path.to_string(),
+        };
+        let resolved = tokio::task::spawn_blocking(move || resolver.resolve(&request))
+            .await
+            .context("resolver task")?;
+        Ok(resolved.map_err(|e| {
+            tracing::warn!(machine = %self.machine, binding, host, error = %e, "credential resolution failed");
+            text(
+                StatusCode::BAD_GATEWAY,
+                "smolvm credentials: credential unavailable",
+            )
+        }))
+    }
+
     fn leaf_config(&self, host: &str) -> Result<Arc<rustls::ServerConfig>> {
         if let Some(config) = self.leaves.lock().expect("leaf cache").get(host) {
             return Ok(config.clone());
@@ -358,10 +389,14 @@ impl State {
         } else {
             format!("{host}:{}", destination.port())
         };
+        let websocket_upgrade = request
+            .headers()
+            .get(header::UPGRADE)
+            .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"));
         if request.uri().scheme().is_some()
             || request.uri().authority().is_some()
             || request.method() == Method::CONNECT
-            || request.headers().contains_key(header::UPGRADE)
+            || (request.headers().contains_key(header::UPGRADE) && !websocket_upgrade)
         {
             return Ok(text(
                 StatusCode::BAD_REQUEST,
@@ -382,6 +417,21 @@ impl State {
                 StatusCode::BAD_REQUEST,
                 "smolvm credentials: Host header must match the TLS server name",
             ));
+        }
+
+        // WebSocket tunneling cannot use the HTTP forwarding client. Tell
+        // clients with an HTTP fallback to retry that transport; never forward
+        // the handshake or substitute its credential into an unsupported flow.
+        if websocket_upgrade {
+            let mut reply = text(
+                StatusCode::UPGRADE_REQUIRED,
+                "smolvm credentials: WebSocket forwarding is unavailable; use HTTP/1.1",
+            );
+            reply.headers_mut().insert(
+                header::UPGRADE,
+                header::HeaderValue::from_static("HTTP/1.1"),
+            );
+            return Ok(reply);
         }
 
         let (parts, body) = request.into_parts();
@@ -410,15 +460,29 @@ impl State {
                 ))
             }
         };
-        if contains(&body, PLACEHOLDER_PREFIX.as_bytes()) {
+        let body_placeholder = match find_body_placeholder(&body) {
+            Ok(found) => found,
+            Err(reason) => return Ok(text(StatusCode::FORBIDDEN, reason)),
+        };
+        if substitution
+            .as_ref()
+            .zip(body_placeholder.as_ref())
+            .is_some_and(|((_, header_placeholder), body_placeholder)| {
+                header_placeholder != body_placeholder
+            })
+        {
             return Ok(text(
                 StatusCode::FORBIDDEN,
-                "smolvm credentials: placeholders are substituted in request headers only",
+                "smolvm credentials: a request may carry one placeholder",
             ));
         }
-
-        if let Some((header_name, placeholder)) = substitution {
-            let Some(binding_name) = self.bindings_by_placeholder.get(&placeholder) else {
+        let mut body = body.to_vec();
+        if let Some(placeholder) = substitution
+            .as_ref()
+            .map(|(_, placeholder)| placeholder)
+            .or(body_placeholder.as_ref())
+        {
+            let Some(binding_name) = self.bindings_by_placeholder.get(placeholder) else {
                 return Ok(text(
                     StatusCode::FORBIDDEN,
                     "smolvm credentials: unknown placeholder",
@@ -440,46 +504,108 @@ impl State {
                     "smolvm credentials: this credential is not allowed for this method",
                 ));
             }
-            let resolver = self.resolver.clone();
-            let request_for_resolver = CredentialRequest {
-                machine: self.machine.clone(),
-                binding: binding_name.clone(),
-                host: host.to_string(),
-                port: destination.port(),
-                method: parts.method.as_str().to_string(),
-                path: target.clone(),
-            };
-            let resolved =
-                tokio::task::spawn_blocking(move || resolver.resolve(&request_for_resolver))
-                    .await
-                    .context("resolver task")?;
-            let secret = match resolved {
+            if substitution.is_some() && !binding.injection_location.header {
+                return Ok(text(
+                    StatusCode::FORBIDDEN,
+                    "smolvm credentials: header substitution is disabled for this binding",
+                ));
+            }
+            if body_placeholder.is_some() {
+                if !binding.injection_location.body {
+                    return Ok(text(
+                        StatusCode::FORBIDDEN,
+                        "smolvm credentials: body substitution is disabled for this binding",
+                    ));
+                }
+                if !headers.get(header::CONTENT_TYPE).is_some_and(|value| {
+                    value.to_str().is_ok_and(|value| {
+                        value.split(';').next().is_some_and(|mime| {
+                            mime.trim()
+                                .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+                        })
+                    })
+                }) {
+                    return Ok(text(
+                        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                        "smolvm credentials: body substitution requires a form body",
+                    ));
+                }
+            }
+            let secret = match self
+                .resolve(
+                    binding_name,
+                    host,
+                    destination,
+                    parts.method.as_str(),
+                    &target,
+                )
+                .await?
+            {
                 Ok(secret) => secret,
-                Err(e) => {
-                    tracing::warn!(machine = %self.machine, binding = %binding_name, host, error = %e, "credential resolution failed");
+                Err(reply) => return Ok(reply),
+            };
+            if let Some((header_name, _)) = &substitution {
+                let current = headers
+                    .get(header_name)
+                    .context("substituted header vanished")?
+                    .as_bytes()
+                    .to_vec();
+                let replaced = replace_once(&current, placeholder.as_bytes(), secret.as_bytes());
+                // Reject control bytes that could split the header.
+                let Ok(mut value) = header::HeaderValue::from_bytes(&replaced) else {
+                    tracing::warn!(machine = %self.machine, binding = %binding_name, host, "credential value is not a valid header value");
                     return Ok(text(
                         StatusCode::BAD_GATEWAY,
                         "smolvm credentials: credential unavailable",
                     ));
+                };
+                value.set_sensitive(true);
+                headers.insert(header_name.clone(), value);
+            }
+            if body_placeholder.is_some() {
+                let encoded = zeroize::Zeroizing::new(form_encode(secret.as_bytes()));
+                body = replace_once(&body, placeholder.as_bytes(), encoded.as_bytes());
+                if body.len() > REQUEST_LIMIT {
+                    return Ok(text(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "smolvm credentials: substituted request body exceeds 8 MiB",
+                    ));
                 }
+            }
+        }
+
+        // Header-setting bindings: the host supplies the whole value and it
+        // replaces whatever the guest sent, placeholder or not.
+        for binding in self.policy.header_bindings(host, parts.method.as_str()) {
+            let header_name = binding
+                .set_header
+                .as_deref()
+                .context("header binding without a header")?;
+            let secret = match self
+                .resolve(
+                    &binding.name,
+                    host,
+                    destination,
+                    parts.method.as_str(),
+                    &target,
+                )
+                .await?
+            {
+                Ok(secret) => secret,
+                Err(reply) => return Ok(reply),
             };
-            let current = headers
-                .get(&header_name)
-                .context("substituted header vanished")?
-                .as_bytes()
-                .to_vec();
-            let replaced = replace_once(&current, placeholder.as_bytes(), secret.as_bytes());
-            // Also refuses a value with CR, LF or other control bytes, which
-            // could otherwise split the header.
-            let Ok(mut value) = header::HeaderValue::from_bytes(&replaced) else {
-                tracing::warn!(machine = %self.machine, binding = %binding_name, host, "credential value is not a valid header value");
+            let (Ok(name), Ok(mut value)) = (
+                header::HeaderName::from_bytes(header_name.as_bytes()),
+                header::HeaderValue::from_bytes(secret.as_bytes()),
+            ) else {
+                tracing::warn!(machine = %self.machine, binding = %binding.name, host, "credential value is not a valid header value");
                 return Ok(text(
                     StatusCode::BAD_GATEWAY,
                     "smolvm credentials: credential unavailable",
                 ));
             };
             value.set_sensitive(true);
-            headers.insert(header_name, value);
+            headers.insert(name, value);
         }
 
         strip_hop_headers(&mut headers);
@@ -510,21 +636,7 @@ impl State {
     }
 }
 
-/// Headers a placeholder may never appear in: they steer routing or framing.
-const PROTECTED_HEADERS: &[&str] = &[
-    "host",
-    "content-length",
-    "transfer-encoding",
-    "connection",
-    "keep-alive",
-    "te",
-    "trailer",
-    "upgrade",
-    "proxy-authorization",
-    "proxy-authenticate",
-    "proxy-connection",
-    "cookie",
-];
+use smolvm_protocol::credentials::PROTECTED_HEADERS;
 
 /// Locate the single placeholder in the request headers.
 ///
@@ -574,6 +686,42 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     find(haystack, needle).is_some()
+}
+
+/// Find the one literal placeholder in a form body, rejecting repeated tokens
+/// before resolving anything or sending the request upstream.
+fn find_body_placeholder(body: &[u8]) -> std::result::Result<Option<String>, &'static str> {
+    let Some(start) = find(body, PLACEHOLDER_PREFIX.as_bytes()) else {
+        return Ok(None);
+    };
+    let end = start
+        + body[start..]
+            .iter()
+            .take_while(|c| c.is_ascii_alphanumeric() || **c == b'_')
+            .count();
+    if contains(&body[end..], PLACEHOLDER_PREFIX.as_bytes()) {
+        return Err("smolvm credentials: a request may carry one placeholder");
+    }
+    let placeholder = std::str::from_utf8(&body[start..end])
+        .map_err(|_| "smolvm credentials: malformed placeholder")?;
+    Ok(Some(placeholder.to_string()))
+}
+
+/// Percent-encode the secret as one form field value: separators and control
+/// characters in a credential must never become new fields in the request.
+fn form_encode(secret: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(secret.len());
+    for &byte in secret {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[(byte >> 4) as usize]));
+            encoded.push(char::from(HEX[(byte & 0xf) as usize]));
+        }
+    }
+    encoded
 }
 
 fn replace_once(value: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
@@ -711,6 +859,7 @@ mod tests {
         addr: SocketAddr,
         cert_pem: Vec<u8>,
         seen: Arc<Mutex<Vec<(String, String)>>>,
+        bodies: Arc<Mutex<Vec<String>>>,
     }
 
     fn provider() -> Arc<rustls::crypto::CryptoProvider> {
@@ -740,6 +889,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let recorded = seen.clone();
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let recorded_bodies = bodies.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -747,12 +898,14 @@ mod tests {
                 };
                 let acceptor = acceptor.clone();
                 let recorded = recorded.clone();
+                let recorded_bodies = recorded_bodies.clone();
                 tokio::spawn(async move {
                     let Ok(tls) = acceptor.accept(stream).await else {
                         return;
                     };
                     let service = service_fn(move |request: Request<Incoming>| {
                         let recorded = recorded.clone();
+                        let recorded_bodies = recorded_bodies.clone();
                         async move {
                             let auth = request
                                 .headers()
@@ -761,6 +914,11 @@ mod tests {
                                 .unwrap_or("")
                                 .to_string();
                             let path = request.uri().path().to_string();
+                            let body = request.into_body().collect().await.unwrap().to_bytes();
+                            recorded_bodies
+                                .lock()
+                                .unwrap()
+                                .push(String::from_utf8_lossy(&body).into_owned());
                             recorded.lock().unwrap().push((auth, path.clone()));
                             Ok::<_, std::convert::Infallible>(text(StatusCode::OK, "upstream ok"))
                         }
@@ -775,6 +933,7 @@ mod tests {
             addr,
             cert_pem,
             seen,
+            bodies,
         }
     }
 
@@ -790,7 +949,6 @@ mod tests {
     }
 
     async fn fixture_with_secret(secret: &str) -> Fixture {
-        let upstream = start_upstream().await;
         let policy = CredentialPolicy {
             credentials: vec![CredentialBinding {
                 name: "svc".into(),
@@ -798,11 +956,21 @@ mod tests {
                 allowed_hosts: vec![CRED_HOST.into()],
                 injection_location: InjectionLocation::default(),
                 methods: DEFAULT_METHODS.iter().map(|m| m.to_string()).collect(),
+                set_header: None,
             }],
         };
+        fixture_with_policy(policy, CRED_HOST, StaticResolver::new().with("svc", secret)).await
+    }
+
+    async fn fixture_with_policy(
+        policy: CredentialPolicy,
+        ca_subtree: &str,
+        resolver: StaticResolver,
+    ) -> Fixture {
+        let upstream = start_upstream().await;
         let placeholders = crate::policy::generate_placeholders(&policy);
-        let placeholder = placeholders["svc"].clone();
-        let ca = MachineCa::generate("test-machine", &[CRED_HOST.to_string()]).unwrap();
+        let placeholder = placeholders.values().next().cloned().unwrap_or_default();
+        let ca = MachineCa::generate("test-machine", &[ca_subtree.to_string()]).unwrap();
         let ca_pem = ca.certificate_pem().to_string();
         let interceptor = Interceptor::spawn(
             InterceptorConfig {
@@ -812,7 +980,7 @@ mod tests {
                 ca,
                 upstream_roots_pem: vec![upstream.cert_pem.clone()],
             },
-            Arc::new(StaticResolver::new().with("svc", secret)),
+            Arc::new(resolver),
         )
         .unwrap();
         Fixture {
@@ -879,6 +1047,92 @@ mod tests {
         );
     }
 
+    /// A wildcard binding that sets `Authorization` on GETs only.
+    async fn header_fixture() -> Fixture {
+        let policy = CredentialPolicy {
+            credentials: vec![CredentialBinding {
+                name: "git".into(),
+                environment_variable: String::new(),
+                allowed_hosts: vec!["*.credential.test".into()],
+                injection_location: InjectionLocation::default(),
+                methods: vec!["GET".into()],
+                set_header: Some("authorization".into()),
+            }],
+        };
+        fixture_with_policy(
+            policy,
+            "credential.test",
+            StaticResolver::new().with("git", "Basic aW5qZWN0ZWQ="),
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sets_the_header_for_a_matching_host_replacing_the_guests() {
+        let f = header_fixture().await;
+        for guest_auth in ["Authorization: Bearer guest-chosen\r\n", ""] {
+            let request = format!(
+                "GET /repo.git/info/refs HTTP/1.1\r\nHost: {CRED_HOST}\r\n{guest_auth}Connection: close\r\n\r\n"
+            );
+            let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+                .await
+                .unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        }
+        let seen = f.upstream.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    "Basic aW5qZWN0ZWQ=".to_string(),
+                    "/repo.git/info/refs".to_string()
+                ),
+                (
+                    "Basic aW5qZWN0ZWQ=".to_string(),
+                    "/repo.git/info/refs".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sets_no_header_for_a_method_the_binding_does_not_allow() {
+        let f = header_fixture().await;
+        let request = format!(
+            "POST /repo.git/git-receive-pack HTTP/1.1\r\nHost: {CRED_HOST}\r\nAuthorization: Bearer guest-chosen\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+            .await
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let seen = f.upstream.seen.lock().unwrap().clone();
+        assert_eq!(seen[0].0, "Bearer guest-chosen");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unresolvable_header_value_fails_closed() {
+        let policy = CredentialPolicy {
+            credentials: vec![CredentialBinding {
+                name: "git".into(),
+                environment_variable: String::new(),
+                allowed_hosts: vec![CRED_HOST.into()],
+                injection_location: InjectionLocation::default(),
+                methods: DEFAULT_METHODS.iter().map(|m| m.to_string()).collect(),
+                set_header: Some("authorization".into()),
+            }],
+        };
+        let f = fixture_with_policy(policy, CRED_HOST, StaticResolver::new()).await;
+        let request = format!("GET / HTTP/1.1\r\nHost: {CRED_HOST}\r\nConnection: close\r\n\r\n");
+        let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+            .await
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+        assert!(
+            f.upstream.seen.lock().unwrap().is_empty(),
+            "nothing reached upstream"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn splices_other_hosts_through_untouched() {
         let f = fixture().await;
@@ -920,6 +1174,130 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oauth_form_body_substitution_is_explicit_scoped_and_encoded() {
+        let mut policy = CredentialPolicy {
+            credentials: vec![CredentialBinding {
+                name: "refresh".into(),
+                environment_variable: "REFRESH_TOKEN".into(),
+                allowed_hosts: vec![CRED_HOST.into()],
+                injection_location: InjectionLocation {
+                    body: true,
+                    ..InjectionLocation::default()
+                },
+                methods: vec!["POST".into()],
+                set_header: None,
+            }],
+        };
+        let secret = "token+with&separator=1";
+        let f = fixture_with_policy(
+            policy.clone(),
+            CRED_HOST,
+            StaticResolver::new().with("refresh", secret),
+        )
+        .await;
+        let body = format!("grant_type=refresh_token&refresh_token={}", f.placeholder);
+        let request = format!(
+            "POST /token HTTP/1.1\r\nHost: {CRED_HOST}\r\nContent-Type: application/x-www-form-urlencoded; charset=utf-8\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            f.placeholder,
+            body.len()
+        );
+        let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+            .await
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(
+            f.upstream.seen.lock().unwrap()[0].0,
+            format!("Bearer {secret}")
+        );
+        assert_eq!(
+            f.upstream.bodies.lock().unwrap()[0],
+            format!(
+                "grant_type=refresh_token&refresh_token={}",
+                form_encode(secret.as_bytes())
+            )
+        );
+
+        policy.credentials[0].injection_location.body = false;
+        let f = fixture_with_policy(
+            policy,
+            CRED_HOST,
+            StaticResolver::new().with("refresh", secret),
+        )
+        .await;
+        let body = format!("refresh_token={}", f.placeholder);
+        let request = format!(
+            "POST /token HTTP/1.1\r\nHost: {CRED_HOST}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+            .await
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(f.upstream.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn form_body_rejects_wrong_type_method_and_unknown_placeholder() {
+        let policy = CredentialPolicy {
+            credentials: vec![CredentialBinding {
+                name: "refresh".into(),
+                environment_variable: "REFRESH_TOKEN".into(),
+                allowed_hosts: vec![CRED_HOST.into()],
+                injection_location: InjectionLocation {
+                    body: true,
+                    ..InjectionLocation::default()
+                },
+                methods: vec!["POST".into()],
+                set_header: None,
+            }],
+        };
+        let f = fixture_with_policy(
+            policy,
+            CRED_HOST,
+            StaticResolver::new().with("refresh", "real"),
+        )
+        .await;
+        for (method, content_type, value, expected) in [
+            ("POST", "application/json", f.placeholder.as_str(), "415"),
+            (
+                "GET",
+                "application/x-www-form-urlencoded",
+                f.placeholder.as_str(),
+                "405",
+            ),
+            (
+                "POST",
+                "application/x-www-form-urlencoded",
+                "SMOL_PLACEHOLDER_FORGED_1",
+                "403",
+            ),
+        ] {
+            let body = format!("refresh_token={value}");
+            let request = format!(
+                "{method} /token HTTP/1.1\r\nHost: {CRED_HOST}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+                .await
+                .unwrap();
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {expected}")),
+                "{response}"
+            );
+        }
+        assert!(f.upstream.seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn form_body_rejects_multiple_placeholders_and_encodes_field_separators() {
+        assert!(
+            find_body_placeholder(b"token=SMOL_PLACEHOLDER_A_1&other=SMOL_PLACEHOLDER_B_2")
+                .is_err()
+        );
+        assert_eq!(form_encode(b"a+b&c=d\n"), "a%2Bb%26c%3Dd%0A");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn refuses_a_value_that_would_split_the_header() {
         let f = fixture_with_secret("real\r\nX-Injected: 1").await;
         let request = format!(
@@ -945,6 +1323,41 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         let seen = f.upstream.seen.lock().unwrap().clone();
         assert_eq!(seen, vec![(String::new(), "/public".to_string())]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_upgrade_requests_get_http_fallback_without_leaking_credentials() {
+        let f = fixture().await;
+        let request = format!(
+            "GET /v1/stream HTTP/1.1\r\nHost: {CRED_HOST}\r\nAuthorization: Bearer {}\r\nConnection: Upgrade, close\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+            f.placeholder
+        );
+        let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+            .await
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 426"), "{response}");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("upgrade: http/1.1\r\n"),
+            "{response}"
+        );
+        assert!(!response.contains(&f.placeholder), "{response}");
+        assert!(f.upstream.seen.lock().unwrap().is_empty());
+
+        // The same client can retry over HTTP and still receive substitution.
+        let request = format!(
+            "GET /v1/stream HTTP/1.1\r\nHost: {CRED_HOST}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            f.placeholder
+        );
+        let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+            .await
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(
+            f.upstream.seen.lock().unwrap().as_slice(),
+            &[("Bearer real-secret".to_string(), "/v1/stream".to_string())]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -591,6 +591,7 @@ pub fn params_secret_env(params: &CreateVmParams) -> smolvm::Result<Vec<(String,
 /// ahead of boot. No-op without a policy.
 pub fn prepare_params_credentials(params: &mut CreateVmParams) -> smolvm::Result<()> {
     if let Some(policy) = params.credential_policy.as_ref().filter(|p| !p.is_empty()) {
+        smolvm::credentials::require_host_sources(policy)?;
         if params.credential_placeholders.is_empty() {
             params.credential_placeholders =
                 smolvm::credentials::prepare_policy(policy, params.dns_filter_hosts.as_deref())?;
@@ -819,6 +820,7 @@ pub(crate) fn build_vm_record_for(
     record.docker_socket = params.docker_socket;
     record.dns_filter_hosts = params.dns_filter_hosts.clone();
     if let Some(policy) = params.credential_policy.as_ref().filter(|p| !p.is_empty()) {
+        smolvm::credentials::require_host_sources(policy)?;
         record.credential_placeholders = if params.credential_placeholders.is_empty() {
             smolvm::credentials::prepare_policy(policy, params.dns_filter_hosts.as_deref())?
         } else {
@@ -3220,9 +3222,26 @@ fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
         "health_retries": record.health_retries,
         "health_startup_grace_secs": record.health_startup_grace_secs,
     });
-    obj.as_object_mut()
-        .unwrap()
-        .insert("network".into(), serde_json::json!(record.network));
+    let fields = obj.as_object_mut().unwrap();
+    fields.insert("network".into(), serde_json::json!(record.network));
+    // The egress allow list, present only when one is set, in the stored form
+    // `machine update` accepts back: `=host` exact, `*.domain` wildcard, bare
+    // `host` for a name and its subdomains, plus CIDRs. Lets a client read the
+    // policy it set with `--reset-allow-list` instead of remembering it.
+    if let Some(hosts) = &record.dns_filter_hosts {
+        fields.insert("allowed_hosts".into(), serde_json::json!(hosts));
+    }
+    if let Some(cidrs) = &record.allowed_cidrs {
+        fields.insert("allowed_cidrs".into(), serde_json::json!(cidrs));
+    }
+    // A branch keeps its staged working copies but never writes them back;
+    // name the machine that does, so tooling can send the user there.
+    if let Some(source) = &record.staged_mounts_detached_from {
+        fields.insert(
+            "staged_mounts_detached_from".into(),
+            serde_json::json!(source),
+        );
+    }
     obj
 }
 

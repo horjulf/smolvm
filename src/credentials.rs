@@ -43,6 +43,27 @@ pub fn prepare_policy(
     Ok(smolvm_credentials::generate_placeholders(policy))
 }
 
+/// Require every binding to name the variable its value is read from, for a
+/// machine whose values come from this host (the CLI) rather than being
+/// supplied by an embedder or API caller. A binding naming none could never be
+/// resolved and would fail every request to its hosts.
+pub fn require_host_sources(policy: &CredentialPolicy) -> Result<()> {
+    match policy
+        .credentials
+        .iter()
+        .find(|b| b.environment_variable.is_empty())
+    {
+        Some(binding) => Err(Error::config(
+            "credentials",
+            format!(
+                "credential {:?} names no environment_variable to read its value from",
+                binding.name
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Split a workload's secret references from its credential environment. A
 /// variable bound to a credential never carries plaintext into the guest: its
 /// reference feeds the interceptor, and the guest gets the placeholder plus
@@ -161,11 +182,16 @@ impl CredentialLaunch {
         if MachineCa::exists(&self.ca_dir) {
             return Ok(());
         }
+        // A wildcard's parent is the subtree the CA may sign in; the name
+        // constraint on it already covers every subdomain.
         let hosts: Vec<String> = self
             .policy
             .credentials
             .iter()
-            .flat_map(|binding| binding.allowed_hosts.iter().cloned())
+            .flat_map(|binding| binding.allowed_hosts.iter())
+            .map(|host| smolvm_protocol::credentials::host_subtree(host).to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .collect();
         MachineCa::generate(&self.ca_owner, &hosts)
             .and_then(|ca| ca.save(&self.ca_dir))
@@ -240,7 +266,10 @@ impl CredentialLaunch {
     /// removed, so it resolves to nothing rather than to a host variable.
     pub fn child_env(&mut self) -> Vec<(String, Option<zeroize::Zeroizing<String>>)> {
         let held = SUPPLIED.lock().unwrap_or_else(|e| e.into_inner());
-        let supplied = held.get(&self.machine);
+        // A branch uses its golden's values unless some were supplied for the
+        // branch itself: it restores guest state that already relies on them,
+        // and its own name is new to whoever supplied the golden's.
+        let supplied = held.get(&self.machine).or_else(|| held.get(&self.ca_owner));
         let mut env = Vec::new();
         for (index, binding) in self.policy.credentials.iter().enumerate() {
             let value = supplied
@@ -278,11 +307,16 @@ impl CredentialResolver for SecretRefResolver {
     }
 }
 
-/// Parse a `--credential NAME=ENV_VAR@HOST[,HOST...]` flag.
+/// Parse a `--credential NAME=ENV_VAR@HOST[,HOST...][:body]` flag.
 pub fn parse_credential_flag(spec: &str) -> std::result::Result<CredentialBinding, String> {
-    let usage = "expected NAME=ENV_VAR@HOST[,HOST...] (e.g. notion=NOTION_API_KEY@api.notion.com)";
+    let usage =
+        "expected NAME=ENV_VAR@HOST[,HOST...][:body] (e.g. notion=NOTION_API_KEY@api.notion.com)";
     let (name, rest) = spec.split_once('=').ok_or(usage)?;
     let (env_var, hosts) = rest.split_once('@').ok_or(usage)?;
+    let (hosts, body) = match hosts.strip_suffix(":body") {
+        Some(hosts) => (hosts, true),
+        None => (hosts, false),
+    };
     let allowed_hosts: Vec<String> = hosts
         .split(',')
         .map(|h| h.trim().to_ascii_lowercase())
@@ -295,11 +329,15 @@ pub fn parse_credential_flag(spec: &str) -> std::result::Result<CredentialBindin
         name: name.trim().to_string(),
         environment_variable: env_var.trim().to_string(),
         allowed_hosts,
-        injection_location: Default::default(),
+        injection_location: smolvm_protocol::credentials::InjectionLocation {
+            body,
+            ..Default::default()
+        },
         methods: smolvm_protocol::credentials::DEFAULT_METHODS
             .iter()
             .map(|m| m.to_string())
             .collect(),
+        set_header: None,
     })
 }
 
@@ -314,8 +352,31 @@ mod tests {
         assert_eq!(b.name, "notion");
         assert_eq!(b.environment_variable, "NOTION_API_KEY");
         assert_eq!(b.allowed_hosts, vec!["api.notion.com", "files.notion.com"]);
+        let b = parse_credential_flag("oauth=REFRESH@auth.example.com:body").unwrap();
+        assert!(b.injection_location.body);
+        assert_eq!(b.allowed_hosts, vec!["auth.example.com"]);
         assert!(parse_credential_flag("notion=NOTION_API_KEY").is_err());
         assert!(parse_credential_flag("=X@h").is_err());
+    }
+
+    #[test]
+    fn file_backed_credential_uses_the_latest_host_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("refresh-token");
+        let source = crate::secrets::file_ref(path.clone());
+        let resolver = SecretRefResolver([("refresh".into(), source)].into());
+        let request = CredentialRequest {
+            machine: "oauth-test".into(),
+            binding: "refresh".into(),
+            host: "auth.example.com".into(),
+            port: 443,
+            method: "POST".into(),
+            path: "/token".into(),
+        };
+        std::fs::write(&path, "first").unwrap();
+        assert_eq!(resolver.resolve(&request).unwrap().as_str(), "first");
+        std::fs::write(&path, "second").unwrap();
+        assert_eq!(resolver.resolve(&request).unwrap().as_str(), "second");
     }
 
     fn launch(machine: &str, supplied_only: bool) -> CredentialLaunch {
@@ -364,6 +425,46 @@ mod tests {
         assert!(!serde_json::to_string(&l).unwrap().contains("value-a"));
         forget_values(machine);
         assert!(launch(machine, false).child_env().is_empty());
+    }
+
+    #[test]
+    fn a_branch_uses_its_goldens_values_until_given_its_own() {
+        let golden = "cred-test-golden";
+        let clone = "cred-test-golden-branch";
+        supply_values(
+            golden,
+            [(
+                "a".to_string(),
+                zeroize::Zeroizing::new("golden-a".to_string()),
+            )]
+            .into(),
+        );
+        let policy = CredentialPolicy {
+            credentials: vec![parse_credential_flag("a=A_KEY@api.a.com").unwrap()],
+        };
+        let mut l = CredentialLaunch::from_parts(
+            clone,
+            &policy,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            Some(golden),
+        )
+        .unwrap();
+        l.supplied_only = true;
+        let env = l.child_env();
+        assert_eq!(env[0].1.as_deref().map(String::as_str), Some("golden-a"));
+        supply_values(
+            clone,
+            [(
+                "a".to_string(),
+                zeroize::Zeroizing::new("branch-a".to_string()),
+            )]
+            .into(),
+        );
+        let env = l.child_env();
+        assert_eq!(env[0].1.as_deref().map(String::as_str), Some("branch-a"));
+        forget_values(golden);
+        forget_values(clone);
     }
 
     #[test]

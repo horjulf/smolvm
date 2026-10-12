@@ -682,13 +682,14 @@ pub struct RunCmd {
     pub trust_host_certs: bool,
 
     /// Bind a credential the workload may use without ever seeing it:
-    /// NAME=ENV_VAR@HOST[,HOST...]. The guest gets a placeholder in ENV_VAR;
+    /// NAME=ENV_VAR@HOST[,HOST...][:body]. The guest gets a placeholder in ENV_VAR;
     /// the host substitutes the real value (from a `--secret-env`/`--secret-file`
     /// ref of the same name, else the host variable ENV_VAR) only on HTTPS
-    /// requests to the listed hosts. Can be used multiple times; implies --net.
+    /// requests to the listed hosts. Add :body for OAuth form-body tokens.
+    /// Can be used multiple times; implies --net.
     #[arg(
         long = "credential",
-        value_name = "NAME=ENV_VAR@HOST",
+        value_name = "NAME=ENV_VAR@HOST[:body]",
         help_heading = "Network"
     )]
     pub credential: Vec<String>,
@@ -1822,12 +1823,41 @@ impl RunCmd {
             params.port.len(),
         )?;
 
-        // A fresh registry-image run starts on a shared seed of its image, so
-        // the guest finds the image already pulled, exactly as `machine start`
-        // does. Best-effort: without a seed the guest pulls as before.
+        // Resolve the image source on the host before launch: registry refs
+        // pass through to the guest pull; a local `docker save` archive or an
+        // unpacked rootfs directory is staged/validated and mounted via
+        // virtiofs (the `.smolmachine` packed-layers path), so no pull happens.
+        let raw_image = self.image.clone().or(params.image.clone());
+        let mut packed_layers_dir = None;
+        let image = match raw_image.as_deref() {
+            Some(img) => {
+                use smolvm::data::image_source::{classify, resolve, ResolvedImage};
+                match resolve(classify(img))? {
+                    ResolvedImage::Registry(reference) => Some(reference),
+                    ResolvedImage::Local {
+                        reference,
+                        packed_layers_dir: dir,
+                    } => {
+                        packed_layers_dir = Some(dir);
+                        Some(reference)
+                    }
+                }
+            }
+            None => None,
+        };
+        // A fresh run starts on a shared seed of its image, so the guest finds
+        // the image already in place, exactly as `machine start` does. A local
+        // archive seeds under its resolved `local:<hash>` reference, which is
+        // what the seed cache keys on. Best-effort: without a seed the guest
+        // pulls or flattens as before.
+        let seed_image = if packed_layers_dir.is_some() {
+            image.clone()
+        } else {
+            params.image.clone()
+        };
         smolvm::image_seed::seed_ephemeral_run_with_trust(
             &vm_name,
-            params.image.as_deref(),
+            seed_image.as_deref(),
             params.storage_gb,
             self.seed_digest_ttl,
             self.proxy_opts.resolved_proxy()?.as_deref(),
@@ -1859,28 +1889,6 @@ impl RunCmd {
             None
         };
 
-        // Resolve the image source on the host before launch: registry refs
-        // pass through to the guest pull; a local `docker save` archive or an
-        // unpacked rootfs directory is staged/validated and mounted via
-        // virtiofs (the `.smolmachine` packed-layers path), so no pull happens.
-        let raw_image = self.image.clone().or(params.image.clone());
-        let mut packed_layers_dir = None;
-        let image = match raw_image.as_deref() {
-            Some(img) => {
-                use smolvm::data::image_source::{classify, resolve, ResolvedImage};
-                match resolve(classify(img))? {
-                    ResolvedImage::Registry(reference) => Some(reference),
-                    ResolvedImage::Local {
-                        reference,
-                        packed_layers_dir: dir,
-                    } => {
-                        packed_layers_dir = Some(dir);
-                        Some(reference)
-                    }
-                }
-            }
-            None => None,
-        };
         let uses_packed_layers = packed_layers_dir.is_some();
 
         let mut features = smolvm::agent::LaunchFeatures {
@@ -4011,11 +4019,12 @@ pub struct CreateCmd {
     pub trust_host_certs: bool,
 
     /// Bind a credential the workload may use without ever seeing it:
-    /// NAME=ENV_VAR@HOST[,HOST...]. The guest gets a placeholder in ENV_VAR;
+    /// NAME=ENV_VAR@HOST[,HOST...][:body]. The guest gets a placeholder in ENV_VAR;
     /// the host substitutes the real value (from a `--secret-env`/`--secret-file`
     /// ref of the same name, else the host variable ENV_VAR) only on HTTPS
-    /// requests to the listed hosts. Can be used multiple times; implies --net.
-    #[arg(long = "credential", value_name = "NAME=ENV_VAR@HOST")]
+    /// requests to the listed hosts. Add :body for OAuth form-body tokens.
+    /// Can be used multiple times; implies --net.
+    #[arg(long = "credential", value_name = "NAME=ENV_VAR@HOST[:body]")]
     pub credential: Vec<String>,
 
     /// Restrict outbound to localhost only (implies --net)
@@ -5882,6 +5891,16 @@ pub struct UpdateCmd {
     #[arg(long = "remove-allow-cidr", value_parser = parse_cidr, value_name = "CIDR")]
     pub remove_allow_cidr: Vec<String>,
 
+    /// Start from an empty allow list before applying this update's
+    /// --allow-host, --allow-host-pattern and --allow-cidr entries, so the
+    /// machine ends up with exactly those and nothing it allowed before. With
+    /// --net and no entries the machine may reach every host.
+    #[arg(
+        long = "reset-allow-list",
+        conflicts_with_all = ["remove_allow_host", "remove_allow_cidr"]
+    )]
+    pub reset_allow_list: bool,
+
     /// Add/replace environment variable (KEY=VALUE)
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
@@ -5940,6 +5959,7 @@ impl UpdateCmd {
             remove_allow_cidrs: self.remove_allow_cidr.clone(),
             outbound_localhost_only: self.outbound_localhost_only,
             allow_all: self.net,
+            reset_allow_list: self.reset_allow_list,
         })
     }
 
@@ -5964,6 +5984,7 @@ impl UpdateCmd {
             outbound_localhost_only,
             remove_allow_host,
             remove_allow_cidr,
+            reset_allow_list,
             env,
             remove_env,
             workdir,
@@ -5981,7 +6002,8 @@ impl UpdateCmd {
             || !allow_host_pattern.is_empty()
             || !allow_cidr.is_empty()
             || !remove_allow_host.is_empty()
-            || !remove_allow_cidr.is_empty();
+            || !remove_allow_cidr.is_empty()
+            || *reset_allow_list;
         let other = !volume.is_empty()
             || !remove_volume.is_empty()
             || !port.is_empty()
@@ -6840,6 +6862,9 @@ impl SyncCmd {
         if record.staged_mounts.is_empty() {
             println!("Machine '{name}' has no staged mounts");
             return Ok(());
+        }
+        if let Some(error) = smolvm::staged_mount::refuse_detached_sync(&record, &name) {
+            return Err(error);
         }
 
         let _source_lock = smolvm::agent::fork::lock_fork_source(&name)?;
