@@ -2059,24 +2059,43 @@ pub fn sync_fork_source(name: &str) -> Result<()> {
 }
 
 /// Join the guest's scattered free pages into the large blocks free page
-/// hinting can hand over. Best effort: an older agent or a kernel without
+/// hinting can hand over, first freeing its clean page cache when
+/// `drop_page_cache` is set. Best effort: an older agent or a kernel without
 /// compaction just leaves memory as it is.
-pub fn compact_guest_memory(name: &str) {
+pub fn compact_guest_memory(name: &str, drop_page_cache: bool) {
+    let command = if drop_page_cache {
+        "echo 1 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory"
+    } else {
+        "echo 1 > /proc/sys/vm/compact_memory"
+    };
     let socket = vm_data_dir(name).join("agent.sock");
     let Ok(mut client) = AgentClient::connect_with_retry(&socket) else {
         return;
     };
     let _ = client.vm_exec(
-        vec![
-            "/bin/sh".to_string(),
-            "-c".to_string(),
-            "echo 1 > /proc/sys/vm/compact_memory".to_string(),
-        ],
+        vec!["/bin/sh".to_string(), "-c".to_string(), command.to_string()],
         Vec::new(),
         None,
         Some(SYNC_FORK_SOURCE_TIMEOUT),
         None,
     );
+}
+
+/// Have the guest hand its free memory to the host before a capture.
+///
+/// Memory a guest frees keeps whatever it last held, so after a build or a
+/// garbage collection most of a VM's RAM is stale data that a capture would
+/// copy. The balloon's free page hinting gives the host every free block to
+/// discard, and the capture then skips it. `drop_page_cache` frees the guest's
+/// clean page cache first, so file data already on disk is discarded too. Best
+/// effort: a VMM without `HINT_FREE` or a guest without the feature only makes
+/// the capture bigger.
+pub fn release_free_guest_memory(name: &str, control: &Path, drop_page_cache: bool) {
+    compact_guest_memory(name, drop_page_cache);
+    match control_socket_cmd_with_timeout(control, "HINT_FREE 2000", Duration::from_secs(5)) {
+        Ok(reply) => tracing::info!(machine = name, reply = ?reply.trim(), "free page hint"),
+        Err(error) => tracing::debug!(machine = name, %error, "free page hint unavailable"),
+    }
 }
 
 /// Release the workload restored in `clone` after its identity and per-fork
@@ -2581,6 +2600,21 @@ pub(crate) fn prepare_forks_reusing(
             return Err(error);
         }
         tracing::info!(%golden, phase = "guest_synced", elapsed_ms = preparation_started.elapsed().as_millis() as u64, "fork preparation progress");
+
+        // A source that is itself a branch keeps every page it has written as
+        // a private copy, and freezing it copies them all into the generation
+        // its children map: one that had written 4 GB froze for over a second.
+        // Most of that is clean page cache and freed memory, so drop and hand
+        // back both first; the copy then holds only what the guest still uses.
+        // A first-level source is adopted in place with nothing copied, so it
+        // keeps its cache.
+        if !fork_continue
+            && !golden_was_paused
+            && (golden_rec.golden.is_some() || golden_rec.fork_lineage_pid_start_time.is_some())
+        {
+            release_free_guest_memory(golden, &ctl, true);
+            tracing::info!(%golden, phase = "memory_released", elapsed_ms = preparation_started.elapsed().as_millis() as u64, "fork preparation progress");
+        }
 
         let forkpoint_armed = match arm_forkpoint_for_capture(golden) {
             Ok(armed) => armed,
