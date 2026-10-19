@@ -46,7 +46,7 @@ machine stopped. A host port already in use fails the command and changes
 nothing. The API equivalent is `PUT /api/v1/machines/{name}/ports` with the
 whole set: `{"ports":[{"host":9090,"guest":9090}]}`.
 
-To grow a running machine's CPUs, RAM or disks, see [live resize](../live-resize.md).
+To grow a running machine's CPUs, RAM or disks, run `smolvm machine resize --help`.
 
 ## Watching a running machine
 
