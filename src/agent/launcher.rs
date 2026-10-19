@@ -1826,9 +1826,9 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // no new control flow in this function. The `active_vsock` set is reused
         // below to inject each service's guest-side activation env vars, so the
         // host and guest sides cannot drift.
-        // `--clipboard`: serve the host clipboard to the guest's commands.
-        let clipboard_socket = resources
-            .clipboard
+        // Serve the host clipboard to the guest's commands, unless the machine
+        // was created with `--no-clipboard`.
+        let clipboard_socket = (!resources.no_clipboard)
             .then(|| vsock_socket.parent())
             .flatten()
             .map(|dir| {

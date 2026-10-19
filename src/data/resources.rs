@@ -158,11 +158,10 @@ pub struct VmResources {
     /// Empty = none. Validated with `smolvm_protocol::resolv::validate_option`.
     #[serde(default)]
     pub dns_options: Vec<String>,
-    /// Bridge the guest's clipboard commands to the host clipboard
-    /// (`--clipboard`). Off by default: a guest that can paste reads
-    /// whatever the user last copied.
+    /// Keep the guest's clipboard commands off the host clipboard
+    /// (`--no-clipboard`). The bridge is on by default.
     #[serde(default)]
-    pub clipboard: bool,
+    pub no_clipboard: bool,
     /// `/dev/shm` size for the workload container (`--shm-size`): a tmpfs
     /// size such as `512m` or `25%` of guest RAM. `None` = half the RAM.
     #[serde(default)]
@@ -264,7 +263,7 @@ impl Default for VmResources {
             egress_rules: Vec::new(),
             dns: None,
             dns_options: Vec::new(),
-            clipboard: false,
+            no_clipboard: false,
             shm_size: None,
             network_name: None,
             guest_subnet: None,

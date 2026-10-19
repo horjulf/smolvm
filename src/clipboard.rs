@@ -1,4 +1,4 @@
-//! Host side of the clipboard bridge (`--clipboard`).
+//! Host side of the clipboard bridge (on unless `--no-clipboard`).
 //!
 //! The VM's boot process listens on `clipboard.sock` in the machine's
 //! directory; libkrun connects it to each guest connection on
@@ -8,8 +8,9 @@
 //! for PNG images), or a Linux desktop's through `wl-copy`/`wl-paste` under
 //! Wayland and `xclip` under X11.
 //!
-//! The bridge is off unless the machine was created with `--clipboard`: a
-//! guest that can paste can read whatever the user last copied.
+//! The bridge is on by default, as in other agent sandboxes: a guest that
+//! can paste reads whatever the user last copied, so a machine running code
+//! that should not see it is created with `--no-clipboard`.
 
 #[cfg(target_os = "macos")]
 use smolvm_protocol::clipboard::PNG;

@@ -1,4 +1,5 @@
-//! Guest clipboard commands bridged to the host clipboard (`--clipboard`).
+//! Guest clipboard commands bridged to the host clipboard (on unless
+//! `--no-clipboard`).
 //!
 //! With the bridge on, the agent binary stands in for the usual clipboard
 //! commands: it is bind-mounted into the workload container (and linked in a

@@ -27,7 +27,7 @@ pub struct VsockServiceInputs<'a> {
     /// forwards each host connection to the guest, which proxies it to the
     /// in-guest dockerd socket. When set, the Docker bridge is enabled.
     pub docker_socket: Option<&'a Path>,
-    /// Host clipboard bridge socket (`--clipboard`): the guest's clipboard
+    /// Host clipboard bridge socket (on unless `--no-clipboard`): the guest's clipboard
     /// commands connect out to it.
     pub clipboard_socket: Option<&'a Path>,
     /// Host socket the workload's output is appended from. When set, the
@@ -113,7 +113,7 @@ impl VsockService for DockerSocketService {
     }
 }
 
-/// Clipboard bridge (`--clipboard`): the guest's `pbcopy`/`xclip`/`wl-copy`
+/// Clipboard bridge (on unless `--no-clipboard`): the guest's `pbcopy`/`xclip`/`wl-copy`
 /// family connects out to the host's clipboard server.
 struct ClipboardService;
 impl VsockService for ClipboardService {

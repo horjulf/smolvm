@@ -298,7 +298,7 @@ pub mod ports {
     /// ping remain as fallbacks. A fork clone resumes past the ring, so it never
     /// dials this — clones detect readiness by pinging the restored agent.
     pub const AGENT_READY: u32 = 6004;
-    /// Host clipboard bridge (`--clipboard`): the guest's `pbcopy`/`xclip`/
+    /// Host clipboard bridge (on unless `--no-clipboard`): the guest's `pbcopy`/`xclip`/
     /// `wl-copy` family connects out with one request line, see
     /// [`crate::clipboard`].
     pub const CLIPBOARD: u32 = 6006;

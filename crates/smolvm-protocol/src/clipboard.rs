@@ -1,4 +1,4 @@
-//! Wire format of the host clipboard bridge (`--clipboard`).
+//! Wire format of the host clipboard bridge.
 //!
 //! A guest clipboard command opens one connection to [`crate::ports::CLIPBOARD`]
 //! and sends one request line:
