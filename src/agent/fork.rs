@@ -2098,6 +2098,16 @@ pub fn release_free_guest_memory(name: &str, control: &Path, drop_page_cache: bo
     }
 }
 
+/// Whether a capture of `source` should first drop its clean page cache and
+/// hand back its free memory: only when it is about to be frozen and its RAM
+/// is private copies over a parent's (a branch, or a source rebased by an
+/// earlier live branch), since only then does freezing copy what it wrote.
+fn releases_memory_before_freeze(continues: bool, already_paused: bool, source: &VmRecord) -> bool {
+    !continues
+        && !already_paused
+        && (source.golden.is_some() || source.fork_lineage_pid_start_time.is_some())
+}
+
 /// Release the workload restored in `clone` after its identity and per-fork
 /// environment are installed. The state directory is private guest RAM, so a
 /// release marker wakes only this clone even though every clone inherited the
@@ -2608,10 +2618,7 @@ pub(crate) fn prepare_forks_reusing(
         // back both first; the copy then holds only what the guest still uses.
         // A first-level source is adopted in place with nothing copied, so it
         // keeps its cache.
-        if !fork_continue
-            && !golden_was_paused
-            && (golden_rec.golden.is_some() || golden_rec.fork_lineage_pid_start_time.is_some())
-        {
+        if releases_memory_before_freeze(fork_continue, golden_was_paused, &golden_rec) {
             release_free_guest_memory(golden, &ctl, true);
             tracing::info!(%golden, phase = "memory_released", elapsed_ms = preparation_started.elapsed().as_millis() as u64, "fork preparation progress");
         }
@@ -5633,6 +5640,30 @@ mod tests {
         assert!(
             !torn_down.get(),
             "a successful rejuvenation must not tear the clone down"
+        );
+    }
+
+    #[test]
+    fn only_a_branch_about_to_freeze_releases_its_memory_first() {
+        let record = || VmRecord::new("src".into(), 1, 512, vec![], vec![], false);
+        let first_level = record();
+        let mut branch = record();
+        branch.golden = Some("parent".into());
+        let mut rebased = record();
+        rebased.fork_lineage_pid_start_time = Some(7);
+        assert!(releases_memory_before_freeze(false, false, &branch));
+        assert!(releases_memory_before_freeze(false, false, &rebased));
+        assert!(
+            !releases_memory_before_freeze(false, false, &first_level),
+            "a first-level source is adopted without a copy"
+        );
+        assert!(
+            !releases_memory_before_freeze(true, false, &branch),
+            "a source that keeps running keeps its cache"
+        );
+        assert!(
+            !releases_memory_before_freeze(false, true, &branch),
+            "a frozen source is not captured again"
         );
     }
 
