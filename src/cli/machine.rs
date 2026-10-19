@@ -658,6 +658,13 @@ pub struct RunCmd {
     #[arg(long = "dns-option", value_name = "OPTION", value_parser = parse_dns_option, help_heading = "Network")]
     pub dns_option: Vec<String>,
 
+    /// Bridge the machine's clipboard commands (`pbcopy`, `pbpaste`, `xclip`,
+    /// `xsel`, `wl-copy`, `wl-paste`) to this host's clipboard, so a program
+    /// inside copies out and pastes in, images included. Off by default: a
+    /// machine that can paste reads whatever you last copied.
+    #[arg(long, help_heading = "Security")]
+    pub clipboard: bool,
+
     /// Size of the workload's /dev/shm: bytes with a k/m/g suffix (`512m`,
     /// `2g`) or a share of guest RAM (`25%`). Defaults to half the RAM.
     #[arg(long = "shm-size", value_name = "SIZE", value_parser = parse_shm_size)]
@@ -1495,6 +1502,7 @@ impl RunCmd {
         params.apply_block_private(self.block_private, std::mem::take(&mut self.allow_private));
         // `--dns-option` is CLI-only (a Smolfile has no resolver options key).
         params.dns_options = self.dns_option.clone();
+        params.clipboard = self.clipboard;
         params.shm_size = self.shm_size.clone();
         params.prepend_deny_cidrs(&self.deny_cidr);
         // `build_create_params` fills resources from the Smolfile, so a CLI-only
@@ -1885,6 +1893,7 @@ impl RunCmd {
             network_backend: params.network_backend,
             dns: params.dns,
             dns_options: params.dns_options.clone(),
+            clipboard: params.clipboard,
             shm_size: params.shm_size.clone(),
             network_name: params.network_name.clone(),
             guest_subnet: params.guest_subnet.clone(),
@@ -4313,6 +4322,13 @@ pub struct CreateCmd {
     #[arg(long = "dns-option", value_name = "OPTION", value_parser = parse_dns_option)]
     pub dns_option: Vec<String>,
 
+    /// Bridge the machine's clipboard commands (`pbcopy`, `pbpaste`, `xclip`,
+    /// `xsel`, `wl-copy`, `wl-paste`) to this host's clipboard, so a program
+    /// inside copies out and pastes in, images included. Off by default: a
+    /// machine that can paste reads whatever you last copied.
+    #[arg(long, help_heading = "Security")]
+    pub clipboard: bool,
+
     /// Size of the workload's /dev/shm: bytes with a k/m/g suffix (`512m`,
     /// `2g`) or a share of guest RAM (`25%`). Defaults to half the RAM.
     #[arg(long = "shm-size", value_name = "SIZE", value_parser = parse_shm_size)]
@@ -4665,6 +4681,7 @@ impl CreateCmd {
         params.apply_block_private(self.block_private, std::mem::take(&mut self.allow_private));
         // `--dns-option` is CLI-only (a Smolfile has no resolver options key).
         params.dns_options = self.dns_option.clone();
+        params.clipboard = self.clipboard;
         params.shm_size = self.shm_size.clone();
         params.prepend_deny_cidrs(&self.deny_cidr);
         // `build_create_params` fills resources from the Smolfile, so a CLI-only
@@ -4723,6 +4740,7 @@ impl CreateCmd {
             network_backend: params.network_backend,
             dns: params.dns,
             dns_options: params.dns_options.clone(),
+            clipboard: params.clipboard,
             shm_size: params.shm_size.clone(),
             network_name: params.network_name.clone(),
             guest_subnet: params.guest_subnet.clone(),
@@ -5121,6 +5139,7 @@ impl CreateCmd {
             network_backend: checkpoint_backend.or(self.net_backend),
             dns: self.dns,
             dns_options,
+            clipboard: self.clipboard,
             shm_size: self.shm_size.clone(),
             network_name: self.network_name.clone(),
             guest_subnet: checkpoint_subnet.or_else(|| self.guest_subnet.clone()),
@@ -5213,6 +5232,7 @@ impl CreateCmd {
             network_backend: params.network_backend,
             dns: params.dns,
             dns_options: params.dns_options.clone(),
+            clipboard: params.clipboard,
             shm_size: params.shm_size.clone(),
             network_name: params.network_name.clone(),
             guest_subnet: params.guest_subnet.clone(),
@@ -6503,6 +6523,15 @@ pub struct UpdateCmd {
     #[arg(long = "dns-option", value_name = "OPTION", value_parser = parse_dns_option, conflicts_with = "clear_dns_options")]
     pub dns_option: Vec<String>,
 
+    /// Bridge the machine's clipboard commands to this host's clipboard from
+    /// its next start (see `machine create --clipboard`).
+    #[arg(long, conflicts_with = "no_clipboard")]
+    pub clipboard: bool,
+
+    /// Stop bridging the machine's clipboard from its next start.
+    #[arg(long)]
+    pub no_clipboard: bool,
+
     /// Size of the workload's /dev/shm: bytes with a k/m/g suffix (`512m`,
     /// `2g`) or a share of guest RAM (`25%`). Defaults to half the RAM.
     #[arg(long = "shm-size", value_name = "SIZE", value_parser = parse_shm_size)]
@@ -6579,6 +6608,8 @@ impl UpdateCmd {
             dns_option,
             clear_dns_options,
             shm_size,
+            clipboard,
+            no_clipboard,
         } = self;
         let egress = *net
             || *outbound_localhost_only
@@ -6607,7 +6638,9 @@ impl UpdateCmd {
             || block_io.is_some()
             || !dns_option.is_empty()
             || *clear_dns_options
-            || shm_size.is_some();
+            || shm_size.is_some()
+            || *clipboard
+            || *no_clipboard;
         (egress, ports, other)
     }
 
@@ -7034,6 +7067,15 @@ impl UpdateCmd {
             } else if self.clear_dns_options {
                 changes.push("  dns options: none".to_string());
                 r.dns_options.clear();
+            }
+
+            // Clipboard bridge, from the next start
+            if self.clipboard || self.no_clipboard {
+                changes.push(format!(
+                    "  clipboard: {}",
+                    if self.clipboard { "bridged" } else { "off" }
+                ));
+                r.clipboard = self.clipboard;
             }
 
             // /dev/shm size, applied when the workload container next starts

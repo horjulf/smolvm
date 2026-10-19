@@ -597,6 +597,11 @@ pub struct VmRecord {
     /// Resolver options for the guest resolv.conf (`--dns-option`), in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dns_options: Vec<String>,
+    /// Bridge the guest's clipboard commands to the host clipboard
+    /// (`--clipboard`). Off by default: a guest that can paste reads
+    /// whatever the user last copied.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clipboard: bool,
     /// `/dev/shm` size for the workload container (`--shm-size`): a tmpfs
     /// size such as `512m` or `25%` of guest RAM. `None` = half the RAM.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -939,6 +944,7 @@ impl VmRecord {
             network_backend: None,
             dns: None,
             dns_options: Vec::new(),
+            clipboard: false,
             shm_size: None,
             network_name: None,
             guest_subnet: None,
@@ -1038,6 +1044,7 @@ impl VmRecord {
             network_backend: None,
             dns: None,
             dns_options: Vec::new(),
+            clipboard: false,
             shm_size: None,
             network_name: None,
             guest_subnet: None,
@@ -1599,6 +1606,7 @@ impl VmRecord {
             egress_rules: self.egress_rules.clone(),
             dns: self.dns,
             dns_options: self.dns_options.clone(),
+            clipboard: self.clipboard,
             shm_size: self.shm_size.clone(),
             network_name: self.network_name.clone(),
             guest_subnet: self.guest_subnet.clone(),
