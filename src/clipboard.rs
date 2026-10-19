@@ -13,9 +13,12 @@
 
 #[cfg(target_os = "macos")]
 use smolvm_protocol::clipboard::PNG;
-use smolvm_protocol::clipboard::{Request, MAX_BYTES, TEXT};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use smolvm_protocol::clipboard::TEXT;
+use smolvm_protocol::clipboard::{Request, MAX_BYTES};
 use std::io::{BufRead, Read, Write};
 use std::path::Path;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::{Command, Stdio};
 
 /// File name of the bridge socket in the machine's directory.
@@ -83,6 +86,7 @@ fn handle(stream: crate::platform::uds::UdsStream, scratch: &Path) {
 }
 
 /// Run `program` with `args`, feeding `input`, and return its stdout.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn run(program: &str, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>, String> {
     let mut child = Command::new(program)
         .args(args)
