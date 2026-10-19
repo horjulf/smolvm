@@ -130,6 +130,9 @@ pub struct ApiState {
     /// directories under (`smolvm serve --local-image-dir`). `None` refuses
     /// local images on the API: a path names the server's own files.
     local_image_dir: RwLock<Option<std::path::PathBuf>>,
+    /// How many children of one branch batch boot at once (`smolvm serve
+    /// --branch-boot-width`). Each holds its slot until its agent answers.
+    branch_boot_width: std::sync::atomic::AtomicUsize,
     /// Runtime-only CUDA pool admission state. Durable pool configuration lives
     /// in SQLite; learned telemetry is intentionally rebuilt after a restart.
     admission: crate::api::admission::AdmissionRegistry,
@@ -355,6 +358,9 @@ impl ApiState {
             allow_nested_virt: std::sync::atomic::AtomicBool::new(false),
             cache_disk_dir: RwLock::new(None),
             local_image_dir: RwLock::new(None),
+            branch_boot_width: std::sync::atomic::AtomicUsize::new(
+                DEFAULT_BRANCH_BOOT_WIDTH as usize,
+            ),
             admission: crate::api::admission::AdmissionRegistry::default(),
             cuda_devices: parking_lot::Mutex::new(None),
             pool_reconcile: Arc::new(tokio::sync::Notify::new()),
@@ -378,6 +384,9 @@ impl ApiState {
             allow_nested_virt: std::sync::atomic::AtomicBool::new(false),
             cache_disk_dir: RwLock::new(None),
             local_image_dir: RwLock::new(None),
+            branch_boot_width: std::sync::atomic::AtomicUsize::new(
+                DEFAULT_BRANCH_BOOT_WIDTH as usize,
+            ),
             admission: crate::api::admission::AdmissionRegistry::default(),
             cuda_devices: parking_lot::Mutex::new(None),
             pool_reconcile: Arc::new(tokio::sync::Notify::new()),
@@ -402,6 +411,19 @@ impl ApiState {
     /// --local-image-dir`.
     pub fn set_local_image_dir(&self, dir: Option<std::path::PathBuf>) {
         *self.local_image_dir.write() = dir;
+    }
+
+    /// Boot up to `width` children of one branch batch at once. Set once from
+    /// `smolvm serve --branch-boot-width`.
+    pub fn set_branch_boot_width(&self, width: usize) {
+        self.branch_boot_width
+            .store(width.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many children of one branch batch boot at once.
+    pub fn branch_boot_width(&self) -> usize {
+        self.branch_boot_width
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The directory local images must live in, or a 400 naming the flag.
@@ -1931,6 +1953,10 @@ pub fn mounts_to_host_mounts(specs: &[MountSpec]) -> Result<Vec<HostMount>, ApiE
         .map(|s| HostMount::try_from(s).map_err(|e| ApiError::BadRequest(e.to_string())))
         .collect()
 }
+
+/// Children of one branch batch that boot at once unless `smolvm serve
+/// --branch-boot-width` says otherwise.
+pub const DEFAULT_BRANCH_BOOT_WIDTH: u16 = 8;
 
 /// The refusal for a machine created from a local image path on a server
 /// without a local image directory.

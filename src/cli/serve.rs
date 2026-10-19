@@ -122,6 +122,17 @@ pub struct ServeStartCmd {
     #[arg(long = "local-image-dir", value_name = "DIR")]
     local_image_dir: Option<std::path::PathBuf>,
 
+    /// How many children of one branch batch boot at once. Each holds its slot
+    /// until its guest agent answers, so a batch of 32 boots in 32 / width
+    /// waves.
+    #[arg(
+        long = "branch-boot-width",
+        value_name = "N",
+        default_value_t = smolvm::api::state::DEFAULT_BRANCH_BOOT_WIDTH,
+        value_parser = clap::value_parser!(u16).range(1..)
+    )]
+    branch_boot_width: u16,
+
     /// Flag, or block, guest traffic to destinations on this watchlist. Each line
     /// is `<label> dns-sha256:<hex>` or `<label> ip-sha256:<hex>`: SHA-256 of a
     /// lowercased DNS name (its subdomains match too) or of an IP address's text.
@@ -446,6 +457,7 @@ impl ServeStartCmd {
         // including errors before the server reaches its normal shutdown path.
         let _detach_machines = DetachMachinesOnExit(state.clone());
         state.set_allow_nested_virt(self.allow_nested_virt);
+        state.set_branch_boot_width(self.branch_boot_width.into());
         if let Some(dir) = &self.cache_disk_dir {
             std::fs::create_dir_all(dir).map_err(|e| {
                 smolvm::error::Error::config(

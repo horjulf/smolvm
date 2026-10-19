@@ -4468,9 +4468,6 @@ pub(crate) async fn fork_machine_inner(
     .await
 }
 
-/// Upper bound on the children of one branch batch that boot at once.
-const MAX_CONCURRENT_BRANCH_BOOTS: usize = 8;
-
 /// Whether a branch request can share its source's transaction with other
 /// requests queued for it. Every queued request was sent before the batch takes
 /// its checkpoint, so one checkpoint taken then is a state of the source each
@@ -4691,7 +4688,8 @@ async fn prepare_and_boot_branches(
                 succeeded
             }
         });
-    run_bounded_futures(boots, MAX_CONCURRENT_BRANCH_BOOTS, |succeeded| succeeded).await;
+    let width = state.branch_boot_width();
+    run_bounded_futures(boots, width, |succeeded| succeeded).await;
     Ok(())
 }
 
