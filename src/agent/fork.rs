@@ -2062,9 +2062,16 @@ pub fn sync_fork_source(name: &str) -> Result<()> {
 /// hinting can hand over, first freeing its clean page cache when
 /// `drop_page_cache` is set. Best effort: an older agent or a kernel without
 /// compaction just leaves memory as it is.
+///
+/// The cache is kept when the guest's PID 1 still runs from `/init.krun`
+/// rather than its in-memory copy (a guest booted before libkrun ran init
+/// from a memfd): that file's pages are served by the VMM that booted it, and
+/// a branch restored by another libkrun build cannot page them back in, so
+/// evicting them reboots the branch the next time init reaps a process.
 pub fn compact_guest_memory(name: &str, drop_page_cache: bool) {
     let command = if drop_page_cache {
-        "echo 1 > /proc/sys/vm/drop_caches; echo 1 > /proc/sys/vm/compact_memory"
+        "case \"$(readlink /proc/1/exe)\" in /memfd:*) echo 1 > /proc/sys/vm/drop_caches;; esac; \
+         echo 1 > /proc/sys/vm/compact_memory"
     } else {
         "echo 1 > /proc/sys/vm/compact_memory"
     };
