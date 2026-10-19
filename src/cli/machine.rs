@@ -6336,9 +6336,9 @@ impl ResizeCmd {
 /// Changes are applied to the DB record and take effect on the next
 /// `machine start`. The machine must be stopped, except to add or remove
 /// allowed hosts and CIDRs on a machine started with an allow list, which take
-/// effect on its next connection or DNS lookup, or to add or remove ports on
-/// their own: TCP ports change at once, UDP ports at the next start. To grow a
-/// running machine's CPUs, RAM or disks, use `machine resize`.
+/// effect on its next connection or DNS lookup, or to add or remove TCP ports
+/// on their own, which apply at once. UDP ports change only while stopped. To
+/// grow a running machine's CPUs, RAM or disks, use `machine resize`.
 ///
 /// Examples:
 ///   smolvm machine update --name myvm -v ./src:/app -p 8080:8080
