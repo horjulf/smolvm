@@ -19,7 +19,7 @@ memory = 2048
 
 # A host mount carries host ownership, so `user` below (made by adduser) could
 # not write to it. Read source in, write build output somewhere else.
-volumes = ["./src:/app"]
+volumes = ["./src:/app:ro"]
 
 init = [
   "sh -c \"id -un > /init-ran-as.txt\"",

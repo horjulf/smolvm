@@ -83,6 +83,22 @@ fn dev_or_top<T>(dev: Vec<T>, top: Vec<T>) -> Vec<T> {
     }
 }
 
+/// Smolfile host mounts that name no `:ro`/`:rw`/`:staged` mode. A Smolfile
+/// usually ships inside the repository it runs, so whether its mounts are
+/// writable should be stated, not inherited from the CLI's writable default.
+/// Disk volumes (a bare guest path) and remote volumes share no host directory
+/// and are left alone.
+fn volumes_without_mode(specs: &[String]) -> Vec<&str> {
+    specs
+        .iter()
+        .map(String::as_str)
+        .filter(|spec| match spec.rsplit_once(':') {
+            None | Some((_, "ro" | "rw" | "staged")) => false,
+            Some((source, _)) => !smolvm::remote_volume::is_remote_source(source),
+        })
+        .collect()
+}
+
 /// Build `CreateVmParams` by merging CLI flags with an optional Smolfile.
 ///
 /// CLI flags override Smolfile values. For Vec fields, CLI values are appended
@@ -248,6 +264,13 @@ pub fn build_create_params(
 
     // Volumes: [dev].volumes > top-level volumes, then CLI extends
     let sf_volumes = dev_or_top(dev.volumes, sf.volumes);
+    for spec in volumes_without_mode(&sf_volumes) {
+        eprintln!(
+            "warning: Smolfile volume '{spec}' has no mode and is writable; Smolfile volumes \
+             will default to read-only in a future release. Add ':rw' to keep writes, or ':ro' \
+             to silence this warning."
+        );
+    }
     let mut volumes = sf_volumes;
     volumes.extend(cli_volume);
 
@@ -672,6 +695,27 @@ pub fn resolve_pack_config_with_defaults(
 mod tests {
     use super::*;
     use smolvm::data::network::PortMapping;
+
+    #[test]
+    fn only_volumes_without_a_mode_are_flagged() {
+        let specs: Vec<String> = [
+            "./src:/app",
+            ".:/workspace",
+            "./src:/app:ro",
+            "./src:/app:rw",
+            "./build:/out:staged",
+            r"C:\data:/data",
+            r"C:\data:/data:ro",
+            "/var/lib/docker",
+            "s3://bucket:/mnt/data",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            volumes_without_mode(&specs),
+            vec!["./src:/app", ".:/workspace", r"C:\data:/data"]
+        );
+    }
 
     fn build_from_smolfile(path: PathBuf) -> smolvm::Result<CreateVmParams> {
         build_create_params(

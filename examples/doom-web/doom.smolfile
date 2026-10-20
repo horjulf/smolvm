@@ -13,5 +13,5 @@ memory = 512
 net = true
 
 [dev]
-volumes = ["./examples/doom-web:/var/www"]
+volumes = ["./examples/doom-web:/var/www:ro"]
 ports = ["8080:8080"]

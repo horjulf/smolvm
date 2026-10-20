@@ -11,7 +11,7 @@ cpus = 4
 memory = 4096
 
 ports = ["8000:8000", "5173-5180:5173-5180"]
-volumes = ["./src:/app"]
+volumes = ["./src:/app:ro"]
 init = ["pip install -r /app/requirements.txt"]
 
 [network]
@@ -55,7 +55,7 @@ storage = 40                          # storage disk GiB (default: 20)
 overlay = 4                           # overlay disk GiB (default: 10)
 
 # Mounts, ports and provisioning ([dev] lists below replace these when set)
-volumes = ["./src:/app"]              # host bind mounts; a guest path alone ("/var/lib/docker") is a directory on the machine's disk
+volumes = ["./src:/app:ro"]           # host bind mounts, host:guest:ro|rw|staged (see Volume modes); a guest path alone ("/var/lib/docker") is a directory on the machine's disk
 ports = ["8080:8080", "27015:27015/udp"]  # host:guest forwarding; /udp for UDP
 init = ["pip install -r requirements.txt"]  # run once as root, on the machine's first start
 
@@ -70,7 +70,7 @@ deny_cidrs = ["169.254.169.254"]      # denied before any allow (implies net)
 
 # Dev profile (used by `machine run` and `machine create`)
 [dev]
-volumes = ["./src:/app"]              # replaces the top-level list when set
+volumes = ["./src:/app:rw"]           # replaces the top-level list when set (rw: npm install writes node_modules into /app)
 ports = ["8080:8080"]                 # replaces the top-level list when set
 init = ["npm install"]                # replaces the top-level list when set
 env = ["APP_MODE=dev"]                # extends the top-level env
@@ -114,6 +114,22 @@ Credential bindings are `[[network.credentials]]` tables, described in
 are `net_backend`, `rosetta`, `cuda`, `auto_graph`, `docker_socket`,
 `block_io`, `disk_durability` and the `[branch]` (or `[fork]`) and `[service]`
 tables; `machine create --help` describes the flag each one mirrors.
+
+## Volume modes
+
+A Smolfile usually travels with the repository it runs, so give every host
+mount a mode instead of relying on the default:
+
+- `:ro`: the machine reads the host directory and cannot change it.
+- `:rw`: the machine can create, change and delete files in it.
+- `:staged`: the machine works on a copy on its own disk, and changes are
+  written back to the host in batches (faster for many small files, but not
+  live, and writable like `:rw`).
+
+A Smolfile host mount with no mode is writable today and prints a warning;
+it will be read-only in a future release. A `-v` given on the command line
+keeps its writable default. `smol file up` already treats an unmarked
+Smolfile mount as read-only.
 
 ## Merge precedence
 

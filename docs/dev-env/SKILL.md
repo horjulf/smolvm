@@ -39,7 +39,7 @@ image = "python:3.12-alpine"
 net = true
 cpus = 2
 memory = 2048
-volumes = ["./src:/app"]
+volumes = ["./src:/app:ro"]
 init = [
   "sh -c \"id -un > /init-ran-as.txt\"",
   "sh -c \"date +%s >> /init-count.txt\"",

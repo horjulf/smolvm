@@ -11,7 +11,7 @@ memory = 4096
 env = ["IS_SANDBOX=1"]
 
 [dev]
-volumes = [".:/workspace"]
+volumes = [".:/workspace:rw"]   # the agent edits the project, so the mount is writable
 workdir = "/workspace"
 init = [
   "apt-get update -qq && apt-get install -yqq git openssh-client ca-certificates ripgrep >/dev/null",

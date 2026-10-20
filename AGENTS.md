@@ -198,14 +198,16 @@ network policy, health check, restart policy, SSH agent and secrets, with a
 `[dev]` profile for `machine run`/`create` and an `[artifact]` profile for
 `pack create`. Use it with `--smolfile`/`-s`. Unknown keys are refused at
 create. CLI flags override scalar values, and `-e`, `-v`, `-p` and `--init`
-extend the Smolfile's lists. Every key and the full merge precedence:
+extend the Smolfile's lists. Give each Smolfile host mount a mode (`:ro`,
+`:rw` or `:staged`): an unmarked one is writable today and warns, and will
+be read-only in a future release. Every key and the full merge precedence:
 `docs/smolfile.md`.
 
 ```toml
 image = "python:3.12-alpine"
 net = true
 ports = ["8000:8000"]
-volumes = ["./src:/app"]
+volumes = ["./src:/app:ro"]
 init = ["pip install -r /app/requirements.txt"]
 
 [network]

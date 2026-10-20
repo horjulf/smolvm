@@ -179,7 +179,7 @@
 //! cuda = true
 //!
 //! [dev]
-//! volumes = ["./src:/app"]
+//! volumes = ["./src:/app:rw"]
 //! init = ["cargo build"]
 //! ports = ["8080:8080"]
 //!

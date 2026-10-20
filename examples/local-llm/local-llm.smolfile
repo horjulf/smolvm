@@ -70,7 +70,7 @@ env = [
 # Mount your local model directory into /models inside the VM.
 # Set the host path to wherever you store .gguf files, for example:
 #
-#   volumes = ["~/.cache/smolvm/models:/models"]
+#   volumes = ["~/.cache/smolvm/models:/models:ro"]
 #
 # Without this, copy models in with:
 #   smolvm machine exec --name llm -- sh -c 'cat > /tmp/model.gguf' < ./model.gguf
