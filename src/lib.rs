@@ -160,3 +160,5 @@ pub use vm::{default_backend, VmBackend, VmHandle};
 
 /// Library version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// dogfood: a comment-only change to the main crate, so a warm golden pays one incremental compile
