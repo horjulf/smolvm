@@ -1,0 +1,36 @@
+# Dogfood: the Linux (x86_64) CI job on `runs-on: smol` machines. Same steps as ci.yml's linux job; the second run of this
+# job starts from a golden taken at its test step, so cargo's target directory is warm and build/clippy/test compile
+# incrementally. Dispatched by hand while the comparison is being measured.
+name: CI on smol
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/smol-dogfood]
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+jobs:
+  linux-smol:
+    name: Linux (x86_64) on smol
+    runs-on: smol-8vcpu
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev pkg-config
+      - name: Rust toolchain
+        run: |
+          if ! command -v cargo >/dev/null; then curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+      - name: Run unit tests
+        run: cargo test --lib --target x86_64-unknown-linux-gnu -p smolvm -p smolvm-pack -p smolvm-registry -p smolvm-protocol -p smolfile -p smolvm-cuda -p smolvm-s3fs
+      - name: Run agent unit tests
+        run: cargo test -p smolvm-agent --bins --target x86_64-unknown-linux-gnu
+      - name: Run K8s shim unit tests
+        run: cargo test -p smolvm-shim --target x86_64-unknown-linux-gnu
