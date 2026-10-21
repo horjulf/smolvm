@@ -2983,10 +2983,17 @@ fn ensure_descendant_after_canonicalize(
 
     match access {
         FilePathAccess::Read => {
+            // A target that does not exist is NOT_FOUND, whatever root it was
+            // resolved against; only a real failure to resolve is an io failure.
             let path_canon = path.canonicalize().map_err(|e| {
+                let code = if e.kind() == std::io::ErrorKind::NotFound {
+                    error_codes::NOT_FOUND
+                } else {
+                    error_codes::FILE_IO_FAILED
+                };
                 AgentResponse::error(
                     format!("failed to canonicalize target {}: {}", original_path, e),
-                    error_codes::FILE_IO_FAILED,
+                    code,
                 )
             })?;
             if !path_canon.starts_with(&root_canon) {
@@ -8656,10 +8663,10 @@ mod tests {
     fn a_missing_directory_is_an_error_not_an_empty_listing() {
         let dir = tempfile::tempdir().unwrap();
         let resp = handle_list_directory(dir.path().join("nope").to_str().unwrap(), None);
-        let AgentResponse::Error { code, .. } = resp else {
+        let AgentResponse::Error { code, message, .. } = resp else {
             panic!("expected an error, got {resp:?}");
         };
-        assert_eq!(code.as_deref(), Some("NOT_FOUND"));
+        assert_eq!(code.as_deref(), Some("NOT_FOUND"), "message: {message}");
 
         let empty = handle_list_directory(dir.path().to_str().unwrap(), None);
         let AgentResponse::Ok { data: Some(data) } = empty else {
@@ -9590,10 +9597,10 @@ mod tests {
         let mut frame = vec![0u8; u32::from_be_bytes(header) as usize];
         client.read_exact(&mut frame).unwrap();
         let response: AgentResponse = serde_json::from_slice(&frame).unwrap();
-        assert!(matches!(
-            response,
-            AgentResponse::Error { code: Some(code), .. } if code == error_codes::NOT_FOUND
-        ));
+        assert!(
+            matches!(&response, AgentResponse::Error { code: Some(code), .. } if code == error_codes::NOT_FOUND),
+            "{response:?}"
+        );
     }
 
     #[test]
