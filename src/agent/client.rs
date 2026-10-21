@@ -5343,11 +5343,15 @@ mod stalled_body_tests {
                     peer.write_all(&header).unwrap();
                     body
                 };
+                // One byte per 100 ms: the whole frame takes seconds, so a client that
+                // waited for it would miss the bound below by a wide margin, while a
+                // client that honours its deadline has seconds of scheduling slack on a
+                // loaded CI machine (a 30 ms/byte, 500 ms bound version failed there).
                 for byte in bytes {
                     if peer.write_all(&[byte]).is_err() {
                         break;
                     }
-                    std::thread::sleep(Duration::from_millis(30));
+                    std::thread::sleep(Duration::from_millis(100));
                 }
             });
             let mut client = AgentClient::from_stream(client_stream);
@@ -5356,7 +5360,11 @@ mod stalled_body_tests {
                 .shutdown_with_deadline(Duration::from_millis(100))
                 .unwrap_err();
             assert!(error.to_string().contains("deadline exceeded"), "{error}");
-            assert!(start.elapsed() < Duration::from_millis(500));
+            assert!(
+                start.elapsed() < Duration::from_millis(1500),
+                "the deadline must not be extended by partial frames: took {:?}",
+                start.elapsed()
+            );
             server.join().unwrap();
         }
     }
