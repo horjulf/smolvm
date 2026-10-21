@@ -364,6 +364,10 @@ pub fn control_socket_cmd_with_timeout(
                 }
                 reply.push(byte[0] as char);
             }
+            // A signal landed during the read (SIGCHLD from a VMM child, say): the
+            // read did nothing, so do it again. `write_all` retries this itself;
+            // a byte-wise `read` does not.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             // A read timeout surfaces as EAGAIN, which says nothing about why.
             Err(e)
                 if matches!(
