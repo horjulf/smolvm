@@ -1784,8 +1784,15 @@ pub fn pack_cache_max_bytes(cache_root: &Path) -> u64 {
     {
         return n;
     }
+    // A share of the disk, never less than the old fixed default, and never more
+    // than the filesystem itself: on a small root (a 10 GiB CI machine) the floor
+    // would otherwise promise a cache larger than the disk that holds it.
     filesystem_capacity_bytes(cache_root)
-        .map(|total| (total / PACK_CACHE_DISK_FRACTION).max(PACK_CACHE_MIN_BYTES))
+        .map(|total| {
+            (total / PACK_CACHE_DISK_FRACTION)
+                .max(PACK_CACHE_MIN_BYTES)
+                .min(total)
+        })
         .unwrap_or(PACK_CACHE_MIN_BYTES)
 }
 
@@ -8857,11 +8864,15 @@ mod tests {
         std::env::remove_var("SMOLVM_PACK_CACHE_MAX_BYTES");
 
         let cap = pack_cache_max_bytes(dir.path());
+        let total_fs = filesystem_capacity_bytes(dir.path());
+        // the floor holds wherever the filesystem can hold it; a filesystem smaller
+        // than the floor (a small CI machine root) gets the whole filesystem instead
+        let floor = total_fs.map_or(PACK_CACHE_MIN_BYTES, |t| t.min(PACK_CACHE_MIN_BYTES));
         assert!(
-            cap >= PACK_CACHE_MIN_BYTES,
-            "the cap must never fall below the old fixed default, got {cap}"
+            cap >= floor,
+            "the cap must never fall below the old fixed default (or the whole filesystem when that is smaller), got {cap}"
         );
-        if let Some(total) = filesystem_capacity_bytes(dir.path()) {
+        if let Some(total) = total_fs {
             // A big disk must yield a bigger cache than the old constant did.
             if total / PACK_CACHE_DISK_FRACTION > PACK_CACHE_MIN_BYTES {
                 assert!(
