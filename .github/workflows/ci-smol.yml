@@ -11,7 +11,7 @@ env:
 jobs:
   linux-smol:
     name: Linux (x86_64) on smol
-    runs-on: smol-8vcpu
+    runs-on: smol
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
