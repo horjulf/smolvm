@@ -52,6 +52,7 @@ mod imp {
     const WORKSPACE_SEED_DIR: &str = "workspace-seed";
     const WORKSPACE_SEED_FILE: &str = "workspace.tar";
     /// Written by the agent once it has seeded `/storage/workspace`.
+    #[cfg(target_os = "macos")]
     const WORKSPACE_SEEDED_MARKER: &str = ".smolvm-workspace-seeded";
     const GIB: u64 = 1024 * 1024 * 1024;
 
