@@ -82,6 +82,7 @@ smolvm machine create --name myvm --image ./myapp.tar     # persistent, from a l
 | Inject API keys / tokens without putting them on the command line | `--secret-env`/`--secret-file` flags or Smolfile `[secrets]` |
 | Minimal VM without image | `smolvm machine run -s Smolfile` (bare VM) |
 | Change mounts/ports/resources on existing VM | `machine update --name NAME -v ./src:/app -p 8080:8080` |
+| Mount a host dir into a running VM, no restart | `machine mount add --name NAME -v ./src:/app` (until it stops) |
 | Declarative VM config | Create a Smolfile, use `--smolfile`/`-s` flag |
 | Move a running machine from an arm64 Mac to arm64 Linux | `machine checkpoint --name NAME -o FILE.checkpoint` on the Mac, then `machine create --name NAME --from FILE.checkpoint` + `machine start` on Linux ([details](docs/mac-to-linux.md)) |
 
@@ -113,6 +114,9 @@ smolvm machine status [--name NAME]               # check state
 smolvm machine stats [--name NAME] [--json]       # CPU % and guest memory
 smolvm machine ls [--json]                        # list all
 smolvm machine update --name NAME [OPTIONS]              # modify stopped machine settings
+smolvm machine mount add --name NAME -v HOST:GUEST[:ro] # mount into a running machine (until it stops)
+smolvm machine mount rm --name NAME -t GUEST              # unmount it, revoking open files
+smolvm machine mount ls --name NAME [--json]              # list mounts added this boot
 smolvm machine cp SRC DST                         # copy files (host↔VM)
 smolvm machine exec --stream --name NAME -- CMD   # streaming output
 smolvm machine monitor [--name NAME]              # foreground health + restart
@@ -541,4 +545,5 @@ can create and run machines. Machines that ask for nested virtualization
 - **`machine logs` shows the workload's output.** The workload's stdout and stderr are appended to `workload.log` in the machine's data directory, kept across restarts, rotated at 10 MiB (three old files kept), and readable while the machine is stopped. `-f` follows, `--tail N` shows the last N lines. Output of `machine exec` is not included. Over the API: `GET /api/v1/machines/{name}/logs?source=workload`.
 - **Observational commands don't stop running VMs.** `machine images`, `machine status`, `machine ls` and similar read-only commands leave a running VM in its current state. If the VM was already running before the command, it stays running after.
 - **`machine prune` works on a running VM.** Regular prune only removes unreferenced layers and is safe while containers are active. `prune --all` requires the VM to be stopped first since it deletes manifests for layers that may be in use.
+- **`machine mount add` mounts into a running machine.** The host directory appears at the guest path at once, in the machine and in every workload container, with no restart; `:ro` is enforced by the host. It lasts until the machine stops (use `machine update -v` to keep a mount), a branch inherits it, and `mount rm` revokes the guest's access, open files included. `POST/GET/DELETE /api/v1/machines/:name/mounts` does the same over the API.
 - **`machine update` modifies a stopped machine.** Add/remove mounts, ports, env vars, or change CPU/memory without recreating the VM. Changes take effect on next `machine start`. Requires the machine to be stopped, except for allow-list changes (`--allow-host`, `--allow-host-pattern`, `--allow-cidr`, `--remove-allow-host`, `--remove-allow-cidr`, `--allow-udp`, `--remove-allow-udp`) on a machine started with an allow list: those apply to its next connection, datagram or DNS lookup and persist across restarts. Lifting the allow list entirely still needs a stop.

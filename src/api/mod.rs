@@ -111,6 +111,9 @@ use state::ApiState;
         handlers::machines::delete_machine,
         handlers::machines::resize_machine,
         handlers::machines::set_machine_ports,
+        handlers::mounts::list_mounts,
+        handlers::mounts::attach_mount,
+        handlers::mounts::detach_mount,
         handlers::machines::publish_cache_disk,
         handlers::machines::delete_cache_base,
         handlers::machines::update_machine_egress,
@@ -370,6 +373,12 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{id}/sync", post(handlers::machines::sync_machine))
         .route("/{id}/resize", post(handlers::machines::resize_machine))
         .route("/{id}/ports", put(handlers::machines::set_machine_ports))
+        .route(
+            "/{id}/mounts",
+            get(handlers::mounts::list_mounts)
+                .post(handlers::mounts::attach_mount)
+                .delete(handlers::mounts::detach_mount),
+        )
         .route(
             "/{id}/egress",
             post(handlers::machines::update_machine_egress),

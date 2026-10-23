@@ -1996,6 +1996,54 @@ impl AgentClient {
         Ok(listing.entries)
     }
 
+    /// Bind a host directory the VMM attached under `share` onto `target`.
+    /// `source` is the host directory, recorded by the agent for listing.
+    pub fn attach_mount(
+        &mut self,
+        share: &str,
+        source: &str,
+        read_only: bool,
+        target: &str,
+    ) -> Result<()> {
+        match self.request(&AgentRequest::AttachMount {
+            share: share.to_string(),
+            source: source.to_string(),
+            read_only,
+            target: target.to_string(),
+        })? {
+            AgentResponse::Ok { .. } => Ok(()),
+            AgentResponse::Error { message, code } => {
+                Err(agent_error("attach mount", message, code.as_deref()))
+            }
+            other => Err(Error::agent(
+                "attach mount",
+                format!("unexpected response: {other:?}"),
+            )),
+        }
+    }
+
+    /// The host directories attached to the running machine.
+    pub fn attached_mounts(&mut self) -> Result<Vec<smolvm_protocol::AttachedMount>> {
+        let resp = self.request(&AgentRequest::ListAttachedMounts)?;
+        expect_data(resp, "list attached mounts")
+    }
+
+    /// Unmount the attached mount at `target`.
+    pub fn detach_mount(&mut self, target: &str) -> Result<()> {
+        match self.request(&AgentRequest::DetachMount {
+            target: target.to_string(),
+        })? {
+            AgentResponse::Ok { .. } => Ok(()),
+            AgentResponse::Error { message, code } => {
+                Err(agent_error("detach mount", message, code.as_deref()))
+            }
+            other => Err(Error::agent(
+                "detach mount",
+                format!("unexpected response: {other:?}"),
+            )),
+        }
+    }
+
     /// Grow a mounted managed filesystem after its disk capacity was increased.
     /// Check capability before changing the backing: old running guests must
     /// not be left with a partially applied resize they cannot complete.

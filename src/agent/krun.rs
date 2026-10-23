@@ -11,6 +11,10 @@ use std::path::{Path, PathBuf};
 /// Serve ownership and mode from the `user.containers.override_stat` xattr
 /// (see libkrun's `KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT`).
 pub const KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT: u32 = 1 << 0;
+/// `krun_add_virtiofs4` flag for a live device: host directories are attached
+/// to it and detached from it at runtime through the control socket (see
+/// libkrun's `KRUN_VIRTIOFS_FLAG_LIVE`).
+pub const KRUN_VIRTIOFS_FLAG_LIVE: u32 = 1 << 1;
 
 /// Whether the libkrun this binary would load can serve host-extracted image
 /// layers with their recorded ownership: on macOS and Windows the server

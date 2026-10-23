@@ -66,6 +66,7 @@ pub mod api;
 /// Reference-safe lifecycle management for Linux shared pack and COW caches.
 #[cfg(target_os = "linux")]
 pub mod artifact_cache;
+pub mod attach;
 pub mod config;
 pub mod credentials;
 // The shared CUDA daemon manages unix-domain sockets, flock, and detached

@@ -2178,6 +2178,51 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             }
         }
 
+        // Attached mounts: two live virtio-fs devices, empty at boot, that host
+        // directories are attached to while the machine runs (`machine mount
+        // add`). libkrun registers them after every other device, so a
+        // checkpoint taken before they existed still restores. A libkrun
+        // without live devices refuses the first, and the machine boots
+        // without them.
+        let mut attach_mounts = false;
+        if let Some(add_virtiofs4) = krun.add_virtiofs4 {
+            let vm_dir = vsock_socket.parent().unwrap_or_else(|| Path::new("."));
+            let mut added = 0;
+            for (tag, read_only) in [
+                (smolvm_protocol::ATTACH_TAG_RW, false),
+                (smolvm_protocol::ATTACH_TAG_RO, true),
+            ] {
+                let root = vm_dir.join(tag);
+                // The device root is never written; shares hang off it.
+                let _ = std::fs::remove_dir_all(&root);
+                if std::fs::create_dir_all(&root).is_err() {
+                    break;
+                }
+                let (Ok(tag_c), Ok(root_c)) = (CString::new(tag), path_to_cstring(&root)) else {
+                    break;
+                };
+                if add_virtiofs4(
+                    ctx,
+                    tag_c.as_ptr(),
+                    root_c.as_ptr(),
+                    0,
+                    read_only,
+                    super::krun::KRUN_VIRTIOFS_FLAG_LIVE,
+                ) < 0
+                {
+                    break;
+                }
+                added += 1;
+            }
+            attach_mounts = added == 2;
+            if !attach_mounts {
+                tracing::debug!(
+                    added,
+                    "libkrun has no live virtio-fs devices; attached mounts unavailable"
+                );
+            }
+        }
+
         // Mount pre-extracted OCI layers for .smolmachine-sourced machines.
         // The agent detects this via SMOLVM_PACKED_LAYERS and uses the layers
         // as container overlay lowerdirs instead of pulling from a registry.
@@ -2339,6 +2384,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             if let Ok(cstr) = CString::new(env_val) {
                 env_strings.push(cstr);
             }
+        }
+
+        if attach_mounts {
+            env_strings.push(cstr("SMOLVM_ATTACH=1"));
         }
 
         if let Some(env) = &cache_disk_env {

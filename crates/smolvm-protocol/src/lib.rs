@@ -541,6 +541,33 @@ mod shutdown_compat_tests {
 /// Agent supports guarded online growth of mounted managed ext4 filesystems.
 pub const ONLINE_FILESYSTEM_GROWTH_CAPABILITY: &str = "online-filesystem-growth-v1";
 
+/// Agent mounts host directories attached to the running machine
+/// (`AttachMount`/`DetachMount`).
+pub const ATTACH_MOUNT_CAPABILITY: &str = "attach-mount-v1";
+
+/// Virtio-fs tag of the live device serving read-write attached mounts.
+pub const ATTACH_TAG_RW: &str = "smolvm_attach_rw";
+/// Virtio-fs tag of the live device serving read-only attached mounts.
+pub const ATTACH_TAG_RO: &str = "smolvm_attach_ro";
+
+/// A host directory attached to the running machine, as the agent reports it.
+///
+/// The agent is the record of what is attached: its state is part of every
+/// checkpoint, so a branch or a restored machine reports exactly the mounts
+/// its guest has, and a cold boot starts with none.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachedMount {
+    /// Name of the share on the live device.
+    pub share: String,
+    /// Host directory, as the host attached it (for display only).
+    pub source: String,
+    /// Guest path it is mounted at.
+    pub target: String,
+    /// Served by the read-only live device.
+    pub read_only: bool,
+}
+
 /// Agent can online and verify CPUs after the VMM creates them.
 pub const ONLINE_CPU_GROWTH_CAPABILITY: &str = "online-cpu-growth-v1";
 /// Guest can offline non-boot CPUs and verify the resulting online set.
@@ -592,6 +619,29 @@ pub enum AgentRequest {
         /// Exact capacity in bytes already published by the VMM.
         expected_bytes: u64,
     },
+    /// Bind a host directory the VMM attached to the running machine onto
+    /// `target`, in the machine root or in every running workload container.
+    /// The host attaches the directory to the live virtio-fs device first; the
+    /// agent only makes it visible at `target`.
+    AttachMount {
+        /// Name the host attached the directory under on the live device.
+        share: String,
+        /// Host directory it came from, kept for listing only.
+        #[serde(default)]
+        source: String,
+        /// Whether it was attached to the read-only live device.
+        read_only: bool,
+        /// Absolute guest path to mount it at.
+        target: String,
+    },
+    /// Unmount an attached mount from `target`, before the host detaches it.
+    DetachMount {
+        /// Absolute guest path it is mounted at.
+        target: String,
+    },
+    /// List the attached mounts, as `Ok` data holding a JSON array of
+    /// [`AttachedMount`].
+    ListAttachedMounts,
     /// Ping to check if agent is alive.
     Ping,
 
@@ -1147,6 +1197,16 @@ impl AgentRequest {
             } => {
                 format!("GrowFilesystem {{ disk: {disk:?}, expected_bytes: {expected_bytes} }}")
             }
+            AgentRequest::AttachMount {
+                share,
+                read_only,
+                target,
+                ..
+            } => format!(
+                "AttachMount {{ share: {share}, read_only: {read_only}, target: {target} }}"
+            ),
+            AgentRequest::DetachMount { target } => format!("DetachMount {{ target: {target} }}"),
+            AgentRequest::ListAttachedMounts => "ListAttachedMounts".into(),
             AgentRequest::Ping => "Ping".into(),
             AgentRequest::FsNotify { events } => format!("FsNotify {{ count: {} }}", events.len()),
             AgentRequest::Pull { image, .. } => format!("Pull {{ image: {image} }}"),

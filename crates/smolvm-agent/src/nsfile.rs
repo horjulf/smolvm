@@ -77,6 +77,18 @@ pub fn run_helper() -> i32 {
             }
         };
     }
+    // argv: [bin, "ns-file", "attach-mount", pid, target, source, ro] — takes
+    // the source mount here, in the caller's namespace, before entering the
+    // container's, where the source path does not exist.
+    if args.get(2).map(String::as_str) == Some("attach-mount") {
+        return match helper_attach_mount(&args) {
+            Ok(()) => 0,
+            Err(e) => {
+                let _ = std::io::stdout().write_all(format!("ERR {e}\n").as_bytes());
+                1
+            }
+        };
+    }
     // argv: [bin, "ns-file", op, pid, path, (mode), (uid), (gid)]
     if args.len() < 5 {
         eprintln!("ns-file: usage: ns-file <read|write> <pid> <path> [mode [uid gid]]");
@@ -106,6 +118,7 @@ pub fn run_helper() -> i32 {
         "connect" => helper_connect(&path),
         "mount-cache" => helper_mount_cache(&path, &args),
         "remount-shm" => helper_remount_shm(&path, &args),
+        "detach-mount" => helper_detach_mount(&path),
         _ => Err("unknown op".to_string()),
     };
     match result {
@@ -115,6 +128,193 @@ pub fn run_helper() -> i32 {
             1
         }
     }
+}
+
+/// `open_tree(2)` and `move_mount(2)`: the same numbers on x86_64 and aarch64
+/// (asm-generic). Named here because the musl `libc` the agent builds against
+/// does not export them.
+#[cfg(target_os = "linux")]
+const SYS_OPEN_TREE: libc::c_long = 428;
+#[cfg(target_os = "linux")]
+const SYS_MOVE_MOUNT: libc::c_long = 429;
+#[cfg(target_os = "linux")]
+const OPEN_TREE_CLONE: libc::c_uint = 1;
+#[cfg(target_os = "linux")]
+const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x4;
+
+/// Clone the attached share at `source` as a detached mount, enter the
+/// container's mount namespace, and attach the clone at `target` there. The
+/// clone carries the mount across: `source` is not a path inside the container.
+#[cfg(target_os = "linux")]
+fn helper_attach_mount(args: &[String]) -> Result<(), String> {
+    use std::os::unix::io::FromRawFd as _;
+
+    let (Some(pid), Some(target), Some(source), Some(ro)) =
+        (args.get(3), args.get(4), args.get(5), args.get(6))
+    else {
+        return Err("usage: attach-mount <pid> <target> <source> <ro|rw>".to_string());
+    };
+    let pid: u32 = pid.parse().map_err(|_| "bad pid".to_string())?;
+    let c = |s: &str| std::ffi::CString::new(s).map_err(|e| e.to_string());
+    let source_c = c(source)?;
+    // SAFETY: a NUL-terminated path; the result is checked before use.
+    let fd = unsafe {
+        libc::syscall(
+            SYS_OPEN_TREE,
+            libc::AT_FDCWD,
+            source_c.as_ptr(),
+            OPEN_TREE_CLONE | libc::O_CLOEXEC as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "open_tree {source}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: open_tree returned a new descriptor this helper owns.
+    let tree = unsafe { std::fs::File::from_raw_fd(fd as libc::c_int) };
+    enter_mount_namespace(pid)?;
+    std::fs::create_dir_all(target).map_err(|e| format!("create {target}: {e}"))?;
+    let target_c = c(target)?;
+    let empty = c("")?;
+    // SAFETY: `tree` is a live detached mount; the paths are NUL-terminated.
+    let rc = unsafe {
+        libc::syscall(
+            SYS_MOVE_MOUNT,
+            std::os::unix::io::AsRawFd::as_raw_fd(&tree),
+            empty.as_ptr(),
+            libc::AT_FDCWD,
+            target_c.as_ptr(),
+            MOVE_MOUNT_F_EMPTY_PATH,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "move_mount {target}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if ro == "ro" {
+        // The host already refuses writes; this reports them as a read-only
+        // filesystem instead of failed writes.
+        // SAFETY: a NUL-terminated path for a mount this helper just made.
+        let rc = unsafe {
+            libc::mount(
+                std::ptr::null(),
+                target_c.as_ptr(),
+                std::ptr::null(),
+                // A bind remount replaces every per-mount flag, so
+                // keep the ones the device was mounted with.
+                libc::MS_REMOUNT
+                    | libc::MS_BIND
+                    | libc::MS_RDONLY
+                    | libc::MS_NOSUID
+                    | libc::MS_NODEV,
+                std::ptr::null(),
+            )
+        };
+        if rc != 0 {
+            let error = std::io::Error::last_os_error();
+            // SAFETY: as above.
+            unsafe { libc::umount2(target_c.as_ptr(), libc::MNT_DETACH) };
+            return Err(format!("make {target} read-only: {error}"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn helper_attach_mount(_args: &[String]) -> Result<(), String> {
+    Err("mount namespaces are Linux-only".to_string())
+}
+
+/// Lazily unmount `target` in the namespace just joined.
+#[cfg(target_os = "linux")]
+fn helper_detach_mount(target: &str) -> Result<(), String> {
+    let target_c = std::ffi::CString::new(target).map_err(|e| e.to_string())?;
+    // SAFETY: a NUL-terminated path.
+    if unsafe { libc::umount2(target_c.as_ptr(), libc::MNT_DETACH) } != 0 {
+        let error = std::io::Error::last_os_error();
+        // Not mounted in this container: nothing to undo.
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL) | Some(libc::ENOENT)
+        ) {
+            return Err(format!("unmount {target}: {error}"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn helper_detach_mount(_target: &str) -> Result<(), String> {
+    Err("mount namespaces are Linux-only".to_string())
+}
+
+/// Whether any workload container runs in a mount namespace of its own.
+#[cfg(target_os = "linux")]
+pub(crate) fn has_live_containers() -> bool {
+    let own = std::fs::read_link("/proc/self/ns/mnt").ok();
+    let skip = [own, std::fs::read_link("/proc/1/ns/mnt").ok()];
+    let containers = live_containers().into_iter().filter_map(|pid| {
+        std::fs::read_link(format!("/proc/{pid}/ns/mnt"))
+            .ok()
+            .map(|ns| (pid, ns))
+    });
+    !namespaces_to_enter(containers, &skip).is_empty()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn has_live_containers() -> bool {
+    false
+}
+
+/// Attach the share at `source` onto `target` in every workload container.
+#[cfg(target_os = "linux")]
+pub(crate) fn attach_in_every_container(
+    source: &Path,
+    target: &str,
+    read_only: bool,
+) -> Result<(), String> {
+    let source = source.to_string_lossy().into_owned();
+    let mode = if read_only { "ro" } else { "rw" };
+    in_every_container(|pid| {
+        [
+            "ns-file",
+            "attach-mount",
+            &pid.to_string(),
+            target,
+            &source,
+            mode,
+        ]
+        .map(String::from)
+        .to_vec()
+    })
+}
+
+/// Unmount `target` in every workload container.
+#[cfg(target_os = "linux")]
+pub(crate) fn detach_in_every_container(target: &str) -> Result<(), String> {
+    in_every_container(|pid| {
+        ["ns-file", "detach-mount", &pid.to_string(), target]
+            .map(String::from)
+            .to_vec()
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn attach_in_every_container(
+    _source: &Path,
+    _target: &str,
+    _read_only: bool,
+) -> Result<(), String> {
+    Err("mount namespaces are Linux-only".to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn detach_in_every_container(_target: &str) -> Result<(), String> {
+    Err("mount namespaces are Linux-only".to_string())
 }
 
 /// Mount the cache slot's filesystem at `path` in the namespace just joined:

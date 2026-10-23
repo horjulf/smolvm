@@ -448,6 +448,10 @@ pub enum MachineCmd {
     /// Synchronize guest-local staged mounts back to their host directories
     Sync(SyncCmd),
 
+    /// Mount or unmount host directories on a running machine, without a restart
+    #[command(subcommand)]
+    Mount(MountCmd),
+
     /// Monitor a machine with health checks and restart policy
     Monitor(MonitorCmd),
 
@@ -498,6 +502,7 @@ impl MachineCmd {
             MachineCmd::Logs(cmd) => cmd.run(),
             MachineCmd::EgressEvents(cmd) => cmd.run(),
             MachineCmd::Ls(cmd) => cmd.run(),
+            MachineCmd::Mount(cmd) => cmd.run(),
             MachineCmd::Resize(cmd) => cmd.run(),
             MachineCmd::Update(cmd) => cmd.run(),
             MachineCmd::Images(cmd) => cmd.run(),
@@ -8316,4 +8321,163 @@ pub(crate) fn parse_shm_size(value: &str) -> Result<String, String> {
 
 pub(crate) fn parse_dns_option(value: &str) -> Result<String, String> {
     smolvm_protocol::resolv::validate_option(value).map(|()| value.to_string())
+}
+
+/// Attached mounts: host directories mounted into a running machine.
+#[derive(Subcommand, Debug)]
+pub enum MountCmd {
+    /// Mount a host directory into a running machine, without restarting it.
+    /// The mount lasts until the machine stops; use `machine update -v` to
+    /// keep one across restarts
+    Add(MountAddCmd),
+    /// Unmount a directory added with `mount add`, without restarting
+    #[command(visible_alias = "rm")]
+    Remove(MountRemoveCmd),
+    /// List the directories mounted with `mount add` since the machine started
+    Ls(MountLsCmd),
+}
+
+impl MountCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        match self {
+            MountCmd::Add(cmd) => cmd.run(),
+            MountCmd::Remove(cmd) => cmd.run(),
+            MountCmd::Ls(cmd) => cmd.run(),
+        }
+    }
+}
+
+/// The record of machine `name`, failing unless it exists, and whether it runs.
+fn mount_target_machine(name: &str) -> smolvm::Result<(smolvm::config::VmRecord, bool)> {
+    let record = smolvm::db::SmolvmDb::open()?
+        .get_vm(name)?
+        .ok_or_else(|| smolvm::Error::vm_not_found(name))?;
+    let running = AgentManager::for_vm(name)?.is_process_alive();
+    Ok((record, running))
+}
+
+/// Mount a host directory into a running machine.
+#[derive(Args, Debug)]
+pub struct MountAddCmd {
+    /// Running machine (default: "default")
+    #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
+    pub name: Option<String>,
+
+    /// Host directory and guest path, as for `-v` (HOST:GUEST[:ro])
+    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
+    pub volume: String,
+}
+
+impl MountAddCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let name = vm_common::vm_label(&self.name);
+        let mount = HostMount::parse(std::slice::from_ref(&self.volume))?
+            .pop()
+            .ok_or_else(|| smolvm::Error::config("mount add", "a mount is required"))?;
+        if mount.staged {
+            return Err(smolvm::Error::config(
+                "mount add",
+                "a staged mount is copied in at boot; add it with `machine update -v` and restart",
+            ));
+        }
+        let (record, running) = mount_target_machine(&name)?;
+        if !running {
+            return Err(smolvm::Error::config(
+                "mount add",
+                format!("machine '{name}' is not running; use `machine update -v` for a stopped machine"),
+            ));
+        }
+        let boot_targets: Vec<String> = record.mounts.iter().map(|m| m.1.clone()).collect();
+        let attached = smolvm::attach::attach(
+            &name,
+            &mount.source,
+            &mount.target,
+            mount.read_only,
+            &boot_targets,
+        )?;
+        println!(
+            "Mounted {} at {}{} in '{name}' until it stops",
+            attached.source,
+            attached.target,
+            if attached.read_only {
+                " (read-only)"
+            } else {
+                ""
+            }
+        );
+        Ok(())
+    }
+}
+
+/// Unmount a directory added with `mount add`.
+#[derive(Args, Debug)]
+pub struct MountRemoveCmd {
+    /// Running machine (default: "default")
+    #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
+    pub name: Option<String>,
+
+    /// Guest path the directory is mounted at
+    #[arg(short = 't', long, value_name = "GUEST")]
+    pub target: std::path::PathBuf,
+}
+
+impl MountRemoveCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let name = vm_common::vm_label(&self.name);
+        let (_, running) = mount_target_machine(&name)?;
+        if !running {
+            return Err(smolvm::Error::config(
+                "mount remove",
+                format!("machine '{name}' is not running, so nothing is attached"),
+            ));
+        }
+        let detached = smolvm::attach::detach(&name, &self.target)?;
+        println!("Unmounted {} from '{name}'", detached.target);
+        Ok(())
+    }
+}
+
+/// List directories mounted with `mount add`.
+#[derive(Args, Debug)]
+pub struct MountLsCmd {
+    /// Machine (default: "default")
+    #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
+    pub name: Option<String>,
+
+    /// Output in JSON format
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl MountLsCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let name = vm_common::vm_label(&self.name);
+        let (_, running) = mount_target_machine(&name)?;
+        // A stopped machine has nothing attached: its next boot starts empty.
+        let mounts = if running {
+            smolvm::attach::list(&name)?
+        } else {
+            Vec::new()
+        };
+        if self.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&mounts).unwrap_or_default()
+            );
+            return Ok(());
+        }
+        if mounts.is_empty() {
+            println!("No directories mounted with `mount add` in '{name}'");
+            return Ok(());
+        }
+        for m in mounts {
+            println!(
+                "{} -> {}{}",
+                m.source,
+                m.target,
+                if m.read_only { " (ro)" } else { "" }
+            );
+        }
+        Ok(())
+    }
 }

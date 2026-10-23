@@ -371,6 +371,15 @@ pub fn add_volume_bind_mounts(spec: &mut OciSpec, mounts: &[(String, String, boo
         let source = volume_bind_source(tag);
         spec.add_bind_mount(&source.to_string_lossy(), container_path, *read_only);
     }
+    // Directories attached while the machine runs reach every container,
+    // including ones created after the attach.
+    let targets: Vec<&str> = mounts
+        .iter()
+        .map(|(_, target, _)| target.as_str())
+        .collect();
+    for (source, target, read_only) in crate::attach::container_binds(&targets) {
+        spec.add_bind_mount(&source.to_string_lossy(), &target, read_only);
+    }
 }
 
 /// Mount a virtiofs device with one policy for every host-backed filesystem:

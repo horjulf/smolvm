@@ -85,6 +85,7 @@ fn boot_log(level: &str, msg: &str) {
         }
     }
 }
+mod attach;
 mod branchpoint;
 mod credentials;
 mod cuda;
@@ -539,6 +540,7 @@ fn main() {
             "volume mounts initialized at boot"
         );
     }
+    attach::mount_devices_at_boot();
 
     // Create /workspace symlink for bare VMs (no -v targeting /workspace).
     // Image-based VMs get /workspace via a bind mount in the container spec,
@@ -2506,6 +2508,9 @@ fn handle_request(
             if workload::logs_enabled() {
                 capabilities.push(smolvm_protocol::WORKLOAD_LOGS_CAPABILITY.to_string());
             }
+            if attach::available() {
+                capabilities.push(smolvm_protocol::ATTACH_MOUNT_CAPABILITY.to_string());
+            }
             // The guest kernel publishes this parameter when its timer driver
             // follows a change of counter rate after a restore.
             if std::path::Path::new("/sys/module/arm_arch_timer/parameters/follows_counter_rate")
@@ -2562,6 +2567,22 @@ fn handle_request(
             expected_bytes,
         } => live_resources::grow_filesystem(disk, expected_bytes, client_fd),
         AgentRequest::MemoryStatus => handle_memory_status(),
+        AgentRequest::AttachMount {
+            share,
+            source,
+            read_only,
+            target,
+        } => match attach::attach(&share, &source, read_only, &target) {
+            Ok(()) => AgentResponse::Ok { data: None },
+            Err(e) => AgentResponse::error(e, smolvm_protocol::error_codes::MOUNT_FAILED),
+        },
+        AgentRequest::DetachMount { target } => match attach::detach(&target) {
+            Ok(()) => AgentResponse::Ok { data: None },
+            Err(e) => AgentResponse::error(e, smolvm_protocol::error_codes::MOUNT_FAILED),
+        },
+        AgentRequest::ListAttachedMounts => AgentResponse::Ok {
+            data: serde_json::to_value(attach::list()).ok(),
+        },
 
         AgentRequest::BranchpointWait { timeout_ms } => {
             let markers = branchpoint::Markers::standard();

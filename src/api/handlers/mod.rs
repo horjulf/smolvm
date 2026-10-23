@@ -5,6 +5,7 @@ pub mod files;
 pub mod health;
 pub mod images;
 pub mod machines;
+pub mod mounts;
 pub mod node;
 pub mod p2p;
 pub mod pools;
