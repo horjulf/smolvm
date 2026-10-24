@@ -4121,7 +4121,6 @@ impl OverlaySetup {
             }
         }
 
-        std::fs::create_dir_all(&self.upper_path)?;
         std::fs::create_dir_all(&self.work_path)?;
         std::fs::create_dir_all(&self.merged_path)?;
 
@@ -4295,16 +4294,26 @@ impl OverlaySetup {
     /// Execute the full overlay setup pipeline with the given lower directories.
     fn execute(self, lowerdirs: Vec<String>) -> Result<OverlayInfo> {
         self.prepare_directories()?;
-        self.setup_upper_layer(&lowerdirs)?;
-        self.verify_layers(&lowerdirs)?;
-        self.mount(&lowerdirs)?;
+        let upper_path = self.upper_path.clone();
+        let staged = Self {
+            upper_path: self.overlay_root.join("upper.initializing"),
+            ..self
+        };
+        staged.setup_upper_layer(&lowerdirs)?;
+        staged.verify_layers(&lowerdirs)?;
+        std::fs::rename(&staged.upper_path, &upper_path)?;
+        let setup = Self {
+            upper_path,
+            ..staged
+        };
+        setup.mount(&lowerdirs)?;
 
-        let entry_count = self.verify_mount();
-        info!(workload_id = %self.workload_id, entry_count = entry_count, "overlay mounted");
+        let entry_count = setup.verify_mount();
+        info!(workload_id = %setup.workload_id, entry_count = entry_count, "overlay mounted");
 
-        refresh_overlay_hostname(&self.merged_path);
-        self.create_bundle()?;
-        Ok(self.into_overlay_info())
+        refresh_overlay_hostname(&setup.merged_path);
+        setup.create_bundle()?;
+        Ok(setup.into_overlay_info())
     }
 
     /// Reuse an existing persistent overlay or create a new one.
@@ -8190,6 +8199,26 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "127.0.0.1 localhost\n127.0.1.1\tworker-2\n"
         );
+    }
+
+    #[test]
+    fn first_setup_does_not_publish_an_incomplete_upper_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let overlay_root = tmp.path().join("overlay");
+        let setup = OverlaySetup {
+            workload_id: "first-setup-test".to_string(),
+            upper_path: overlay_root.join("upper"),
+            work_path: overlay_root.join("work"),
+            merged_path: overlay_root.join("merged"),
+            overlay_root,
+        };
+
+        setup.prepare_directories().unwrap();
+        assert!(!setup.upper_path.exists());
+        std::fs::create_dir(setup.overlay_root.join("upper.initializing")).unwrap();
+        setup.prepare_directories().unwrap();
+        assert!(!setup.overlay_root.join("upper.initializing").exists());
+        assert!(!setup.upper_path.exists());
     }
 
     #[test]
