@@ -4419,13 +4419,28 @@ fn write_overlay_resolver(root: &Path) -> std::io::Result<bool> {
     use std::os::unix::io::{AsRawFd, FromRawFd};
     let root_dir = std::fs::File::open(root)?;
     // SAFETY: `root_dir` is open and the path is a NUL-terminated literal.
-    let etc = unsafe {
+    let mut etc = unsafe {
         libc::openat(
             root_dir.as_raw_fd(),
             c"etc".as_ptr(),
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
+    if etc < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+        if unsafe { libc::mkdirat(root_dir.as_raw_fd(), c"etc".as_ptr(), 0o755) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EEXIST) {
+                return Err(error);
+            }
+        }
+        etc = unsafe {
+            libc::openat(
+                root_dir.as_raw_fd(),
+                c"etc".as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+    }
     if etc < 0 {
         let error = std::io::Error::last_os_error();
         return match error.raw_os_error() {
@@ -8030,6 +8045,21 @@ mod tests {
         assert!(std::fs::read_to_string(&path)
             .unwrap()
             .ends_with("127.0.1.1\tworker-2\n"));
+    }
+
+    #[test]
+    fn refresh_overlay_resolver_restores_missing_upper_etc() {
+        let _guard = env_lock().lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let upper = tmp.path().join("upper");
+        std::fs::create_dir(&upper).unwrap();
+
+        refresh_overlay_resolver(&upper).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(upper.join("etc/resolv.conf")).unwrap(),
+            overlay_resolv_conf_contents()
+        );
     }
 
     // An image's symlinked hosts, or a symlinked resolv.conf that resolves
