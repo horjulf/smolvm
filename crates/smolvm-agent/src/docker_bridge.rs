@@ -73,7 +73,7 @@ fn run_bridge() -> io::Result<()> {
 /// semantics hijacked attach streams rely on.
 #[cfg(target_os = "linux")]
 fn relay_to_daemon(host_conn: crate::vsock::VsockStream) -> io::Result<()> {
-    let daemon = std::os::unix::net::UnixStream::connect(GUEST_DOCKER_SOCK)?;
+    let daemon = crate::publish_socket::dial_app(GUEST_DOCKER_SOCK)?;
     crate::relay::relay_half_close(host_conn, daemon)
 }
 
